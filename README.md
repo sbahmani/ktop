@@ -1,2 +1,2 @@
-# ktop
-A powerful htop-like CLI tool for Kubernetes cluster resource monitoring - displays real-time CPU/memory requests, limits, and usage across all nodes with smart memory corruption handling and advanced sorting capabilities
+📊 Overview
+ktop is a powerful command-line tool for monitoring Kubernetes node resource allocation and usage. It provides a comprehensive view of CPU and memory requests, limits, actual usage, and capacity across all nodes in your cluster, similar to htop but for Kubernetes nodes.
