@@ -9,8 +9,9 @@ Parallel Processing: Fast data collection with configurable parallel queries
 Multiple Output Formats: Table (default), CSV, JSON
 Watch Mode: Auto-refresh display at specified intervals
 Color-Coded Alerts: Visual indicators for resource usage levels
-🟢 Green: 0-59% (Normal)
-🟡 Yellow: 60-79% (Warning)
-🔴 Red: 80%+ (Critical)
+- 🟢 Green: 0-59% (Normal)
+- 🟡 Yellow: 60-79% (Warning)
+- 🔴 Red: 80%+ (Critical)
+
 Node Filtering: Include or exclude control-plane nodes
 Resource Totals: Summary row showing cluster-wide resource allocation
