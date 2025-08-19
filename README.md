@@ -15,3 +15,13 @@ Color-Coded Alerts: Visual indicators for resource usage levels
 
 Node Filtering: Include or exclude control-plane nodes
 Resource Totals: Summary row showing cluster-wide resource allocation
+
+📋 Requirements
+- Kubernetes cluster (v1.19+)
+- kubectl configured with cluster access
+- metrics-server installed in the cluster
+- jq for JSON parsing
+- bc for calculations
+- bash 4.0+
+
+🚀 Installation
