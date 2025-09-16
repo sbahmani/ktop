@@ -279,6 +279,18 @@ process_node() {
     # Convert memory capacity to Gi
     local mem_total_gi=$(to_gi "$mem_capacity")
     
+    # Handle ERR values for memory capacity
+    if [[ "$mem_total_gi" == "ERR" ]]; then
+        # Try to get memory from status.capacity instead of allocatable
+        mem_capacity=$(echo "$node_json" | jq -r '.status.capacity.memory')
+        mem_total_gi=$(to_gi "$mem_capacity")
+        
+        # If still error, set to 0
+        if [[ "$mem_total_gi" == "ERR" ]]; then
+            mem_total_gi="0"
+        fi
+    fi
+    
     # Get allocated resources from describe
     local describe=$(kubectl describe node $node 2>/dev/null)
     local allocated=$(echo "$describe" | grep -A 10 "Allocated resources:")
@@ -338,6 +350,12 @@ process_node() {
     [[ -z "$cpu_lim_m" ]] && cpu_lim_m=0
     [[ -z "$cpu_use_m" ]] && cpu_use_m=0
     
+    # Ensure all memory values are numeric (not "ERR")
+    [[ "$mem_req_gi" == "ERR" ]] && mem_req_gi="0"
+    [[ "$mem_lim_gi" == "ERR" ]] && mem_lim_gi="0"
+    [[ "$mem_use_gi" == "ERR" ]] && mem_use_gi="0"
+    [[ "$mem_total_gi" == "ERR" ]] && mem_total_gi="0"
+    
     # Determine sort value
     local sort_value
     case "$SORT_BY" in
@@ -346,7 +364,7 @@ process_node() {
         cpu-lim)    sort_value=$(printf "%010d" $cpu_lim_m) ;;
         cpu-use)    sort_value=$(printf "%010d" $cpu_use_m) ;;
         cpu-pct)    sort_value=$(printf "%010d" ${cpu_use_pct:-0}) ;;
-        cpu-cap)    sort_value=$(printf "%010.1f" $cpu_total) ;;
+        cpu-cap)    sort_value=$(printf "%010.1f" ${cpu_total:-0}) ;;
         mem-req)    sort_value=$(printf "%010.1f" ${mem_req_gi:-0}) ;;
         mem-lim)    sort_value=$(printf "%010.1f" ${mem_lim_gi:-0}) ;;
         mem-use)    sort_value=$(printf "%010.1f" ${mem_use_gi:-0}) ;;
@@ -562,3 +580,4 @@ if [[ $WATCH_INTERVAL -gt 0 ]]; then
 else
     display_resources
 fi
+
