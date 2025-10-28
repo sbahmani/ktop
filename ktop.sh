@@ -177,11 +177,15 @@ kubectl_with_retry() {
     local max_retries=3
     local retry_count=0
     local delay=2
+    local output
     local error_output
     
     while [[ $retry_count -lt $max_retries ]]; do
-        if error_output=$(kubectl "$@" 2>&1); then
+        if output=$(kubectl "$@" 2>/dev/null); then
+            echo "$output"
             return 0
+        else
+            error_output=$(kubectl "$@" 2>&1)
         fi
         
         retry_count=$((retry_count + 1))
@@ -709,14 +713,12 @@ display_resources() {
 cleanup() {
     # Clean up any temporary files
     rm -f /tmp/ktop.* 2>/dev/null
-    echo -e "\nExiting..."
-    exit 0
 }
 
 # Main execution
 if [[ $WATCH_INTERVAL -gt 0 ]]; then
     # Trap Ctrl+C for clean exit
-    trap cleanup INT TERM
+    trap 'cleanup; echo -e "\nExiting..."; exit 0' INT TERM
     
     while true; do
         clear
