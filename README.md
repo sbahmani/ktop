@@ -1,6 +1,8 @@
 ## 📊 Overview
 ktop is a powerful command-line tool for monitoring Kubernetes node resource allocation and usage. It provides a comprehensive view of CPU and memory requests, limits, actual usage, and capacity across all nodes in your cluster, similar to htop but for Kubernetes nodes.
 
+**Version:** 1.2.0
+
 ## ✨ Features
 Real-time Resource Monitoring: View CPU and memory requests, limits, usage, and capacity
 Smart Memory Corruption Handling: Automatically detects and fixes Kubernetes memory reporting bugs
@@ -16,6 +18,9 @@ Color-Coded Alerts: Visual indicators for resource usage levels
 Node Filtering: Include or exclude control-plane nodes
 Resource Totals: Summary row showing cluster-wide resource allocation
 Request Percentage Tracking: Monitor CPU and memory request utilization as percentage of node capacity
+Environment Variable Support: Configure defaults via environment variables
+Version Information: Built-in version tracking and display
+Enhanced Error Handling: Better error messages and retry logic
 
 ## 📋 Requirements
 - Kubernetes cluster (v1.19+)
@@ -70,12 +75,21 @@ ktop -S mem-req-pct
 
 # Watch mode - refresh every 5 seconds
 ktop -w 5
+
+# Show version information
+ktop --version
+
+# Use environment variables for configuration
+export KTOP_PARALLEL=8
+export KTOP_FORMAT=json
+ktop
 ````
 ### Command-Line Options
 
 | Option | Description | Example |
 |--------|-------------|---------|
 | `-h, --help` | Show help message | `ktop -h` |
+| `-v, --version` | Show version information | `ktop --version` |
 | `-P <num>` | Number of parallel kubectl queries (default: 4) | `ktop -P 8` |
 | `-a, --all` | Include control-plane nodes | `ktop --all` |
 | `-n, --no-color` | Disable color output | `ktop --no-color` |
@@ -177,13 +191,28 @@ ktop --all -o csv | awk -F',' 'NR>1 {print $1","$4","$9}'
 ### Environment Variables
 
 ```bash
-# Set default parallel queries
+# Set default parallel queries (1-50)
 export KTOP_PARALLEL=12
 
-# Set default output format
+# Set default output format (table, csv, json)
 export KTOP_FORMAT=table
+
+# Include control-plane nodes by default
+export KTOP_ALL=true
 
 # Disable color by default
 export KTOP_NO_COLOR=true
+
+# Don't show summary totals by default
+export KTOP_NO_SUM=false
+
+# Set default watch interval (0 = no watch)
+export KTOP_WATCH=0
+
+# Set default sort field
+export KTOP_SORT=cpu-req
+
+# Enable verbose mode (shows configuration info)
+export KTOP_VERBOSE=true
 ```
 

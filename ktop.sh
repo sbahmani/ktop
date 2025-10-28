@@ -2,6 +2,8 @@
 
 # ktop - Kubernetes Node Resource Monitor
 # Description: Display worker node resource allocation and usage with sorting options
+# Version: 1.2.0
+# Author: sbahmani
 
 # Color codes
 RED='\033[0;31m'
@@ -10,19 +12,22 @@ GREEN='\033[0;32m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Default settings
-PARALLEL=4
-OUTPUT_FORMAT="table"
-SHOW_ALL=false
-NO_COLOR=false
-NO_SUM=false
-WATCH_INTERVAL=0
-SORT_BY="cpu-req"  # Default sort by CPU requests
+# Version information
+VERSION="1.2.0"
+
+# Default settings (can be overridden by environment variables)
+PARALLEL=${KTOP_PARALLEL:-4}
+OUTPUT_FORMAT=${KTOP_FORMAT:-"table"}
+SHOW_ALL=${KTOP_ALL:-false}
+NO_COLOR=${KTOP_NO_COLOR:-false}
+NO_SUM=${KTOP_NO_SUM:-false}
+WATCH_INTERVAL=${KTOP_WATCH:-0}
+SORT_BY=${KTOP_SORT:-"cpu-req"}  # Default sort by CPU requests
 SORT_ORDER="desc"  # Default descending order
 
 # Help function
 show_help() {
-    echo -e "${BOLD}ktop - Kubernetes Worker Node Resource Monitor${NC}"
+    echo -e "${BOLD}ktop - Kubernetes Worker Node Resource Monitor v${VERSION}${NC}"
     echo ""
     echo -e "${BOLD}USAGE:${NC}"
     echo "    ktop [OPTIONS]"
@@ -31,8 +36,18 @@ show_help() {
     echo "    Display Kubernetes worker nodes' CPU and memory allocation, usage, and capacity."
     echo "    Shows resource requests, limits, actual usage, percentages, and total capacity."
     echo ""
+    echo -e "${BOLD}ENVIRONMENT VARIABLES:${NC}"
+    echo "    KTOP_PARALLEL    Number of parallel queries (default: 4)"
+    echo "    KTOP_FORMAT      Output format: table, csv, json (default: table)"
+    echo "    KTOP_ALL         Include control-plane nodes (default: false)"
+    echo "    KTOP_NO_COLOR    Disable color output (default: false)"
+    echo "    KTOP_NO_SUM      Don't show summary totals (default: false)"
+    echo "    KTOP_WATCH       Auto-refresh interval in seconds (default: 0)"
+    echo "    KTOP_SORT        Default sort field (default: cpu-req)"
+    echo ""
     echo -e "${BOLD}OPTIONS:${NC}"
     echo "    -h, --help          Show this help message"
+    echo "    -v, --version       Show version information"
     echo "    -P <num>            Number of parallel kubectl queries (default: 4)"
     echo "    -a, --all           Include control-plane nodes"
     echo "    -n, --no-color      Disable color output"
@@ -97,8 +112,8 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -P)
-            if [[ ! "$2" =~ ^[0-9]+$ ]]; then
-                echo "Error: -P requires a numeric value"
+            if [[ ! "$2" =~ ^[0-9]+$ ]] || [[ "$2" -lt 1 ]] || [[ "$2" -gt 50 ]]; then
+                echo "Error: -P requires a numeric value between 1 and 50"
                 exit 1
             fi
             PARALLEL="$2"
@@ -117,9 +132,13 @@ while [[ $# -gt 0 ]]; do
             NO_SUM=true
             shift
             ;;
+        -v|--version)
+            echo "ktop version ${VERSION}"
+            exit 0
+            ;;
         -w|--watch)
-            if [[ ! "$2" =~ ^[0-9]+$ ]]; then
-                echo "Error: -w requires a numeric value (seconds)"
+            if [[ ! "$2" =~ ^[0-9]+$ ]] || [[ "$2" -lt 1 ]]; then
+                echo "Error: -w requires a positive numeric value (seconds)"
                 exit 1
             fi
             WATCH_INTERVAL="$2"
@@ -153,25 +172,75 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Function to retry kubectl commands
+# Function to retry kubectl commands with better error handling
 kubectl_with_retry() {
     local max_retries=3
     local retry_count=0
     local delay=2
+    local error_output
     
     while [[ $retry_count -lt $max_retries ]]; do
-        if kubectl "$@" 2>/dev/null; then
+        if error_output=$(kubectl "$@" 2>&1); then
             return 0
         fi
         
         retry_count=$((retry_count + 1))
         if [[ $retry_count -lt $max_retries ]]; then
+            # Only show retry message for non-critical errors
+            if [[ "$*" != *"get nodes"* ]] && [[ "$*" != *"top nodes"* ]]; then
+                echo "Warning: kubectl command failed, retrying in ${delay}s... (attempt ${retry_count}/${max_retries})" >&2
+            fi
             sleep $delay
             delay=$((delay * 2))  # Exponential backoff
         fi
     done
     
+    # Store error for debugging if needed
+    echo "Error: kubectl command failed after ${max_retries} attempts: $error_output" >&2
     return 1
+}
+
+# Function to validate environment variables
+validate_env_vars() {
+    # Validate PARALLEL
+    if [[ ! "$PARALLEL" =~ ^[0-9]+$ ]] || [[ "$PARALLEL" -lt 1 ]] || [[ "$PARALLEL" -gt 50 ]]; then
+        echo "Warning: Invalid KTOP_PARALLEL value '$PARALLEL', using default 4"
+        PARALLEL=4
+    fi
+    
+    # Validate OUTPUT_FORMAT
+    if [[ ! "$OUTPUT_FORMAT" =~ ^(table|csv|json)$ ]]; then
+        echo "Warning: Invalid KTOP_FORMAT value '$OUTPUT_FORMAT', using default 'table'"
+        OUTPUT_FORMAT="table"
+    fi
+    
+    # Validate boolean variables
+    if [[ "$SHOW_ALL" != "true" ]] && [[ "$SHOW_ALL" != "false" ]]; then
+        echo "Warning: Invalid KTOP_ALL value '$SHOW_ALL', using default 'false'"
+        SHOW_ALL=false
+    fi
+    
+    if [[ "$NO_COLOR" != "true" ]] && [[ "$NO_COLOR" != "false" ]]; then
+        echo "Warning: Invalid KTOP_NO_COLOR value '$NO_COLOR', using default 'false'"
+        NO_COLOR=false
+    fi
+    
+    if [[ "$NO_SUM" != "true" ]] && [[ "$NO_SUM" != "false" ]]; then
+        echo "Warning: Invalid KTOP_NO_SUM value '$NO_SUM', using default 'false'"
+        NO_SUM=false
+    fi
+    
+    # Validate WATCH_INTERVAL
+    if [[ ! "$WATCH_INTERVAL" =~ ^[0-9]+$ ]] || [[ "$WATCH_INTERVAL" -lt 0 ]]; then
+        echo "Warning: Invalid KTOP_WATCH value '$WATCH_INTERVAL', using default 0"
+        WATCH_INTERVAL=0
+    fi
+    
+    # Validate SORT_BY
+    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct)$ ]]; then
+        echo "Warning: Invalid KTOP_SORT value '$SORT_BY', using default 'cpu-req'"
+        SORT_BY="cpu-req"
+    fi
 }
 
 # Check dependencies
@@ -190,16 +259,21 @@ if ! command -v bc &> /dev/null; then
     exit 1
 fi
 
+# Validate environment variables
+validate_env_vars
+
 # Check kubectl access
 if ! kubectl_with_retry get nodes &> /dev/null; then
-    echo "Error: Cannot access Kubernetes cluster. Check your kubeconfig."
+    echo "Error: Cannot access Kubernetes cluster. Check your kubeconfig and cluster connectivity."
+    echo "Try: kubectl cluster-info"
     exit 1
 fi
 
 # Check metrics-server
 if ! kubectl_with_retry top nodes &> /dev/null; then
-    echo "Error: metrics-server is not installed or not working"
+    echo "Error: metrics-server is not installed or not working properly."
     echo "Install with: kubectl apply -f https://github.com/kubernetes-metrics/metrics-server/releases/latest/download/components.yaml"
+    echo "Wait a few minutes for metrics-server to start collecting metrics."
     exit 1
 fi
 
@@ -443,6 +517,11 @@ display_resources() {
         echo -e "${BOLD}Sorted by: ${SORT_BY} (${SORT_ORDER}ending)${NC}"
     fi
     
+    # Show configuration info in verbose mode
+    if [[ "${KTOP_VERBOSE:-false}" == "true" ]]; then
+        echo -e "${BOLD}Configuration:${NC} Parallel: ${PARALLEL}, Format: ${OUTPUT_FORMAT}, All nodes: ${SHOW_ALL}"
+    fi
+    
     # Prepare data
     temp_file=$(mktemp)
     
@@ -626,10 +705,18 @@ display_resources() {
     rm -f $temp_file
 }
 
+# Cleanup function
+cleanup() {
+    # Clean up any temporary files
+    rm -f /tmp/ktop.* 2>/dev/null
+    echo -e "\nExiting..."
+    exit 0
+}
+
 # Main execution
 if [[ $WATCH_INTERVAL -gt 0 ]]; then
     # Trap Ctrl+C for clean exit
-    trap 'echo -e "\nExiting..."; exit 0' INT
+    trap cleanup INT TERM
     
     while true; do
         clear
@@ -639,6 +726,8 @@ if [[ $WATCH_INTERVAL -gt 0 ]]; then
         sleep $WATCH_INTERVAL
     done
 else
+    # Single run mode
     display_resources
+    cleanup
 fi
 
