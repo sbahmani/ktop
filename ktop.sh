@@ -153,6 +153,27 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Function to retry kubectl commands
+kubectl_with_retry() {
+    local max_retries=3
+    local retry_count=0
+    local delay=2
+    
+    while [[ $retry_count -lt $max_retries ]]; do
+        if kubectl "$@" 2>/dev/null; then
+            return 0
+        fi
+        
+        retry_count=$((retry_count + 1))
+        if [[ $retry_count -lt $max_retries ]]; then
+            sleep $delay
+            delay=$((delay * 2))  # Exponential backoff
+        fi
+    done
+    
+    return 1
+}
+
 # Check dependencies
 if ! command -v kubectl &> /dev/null; then
     echo "Error: kubectl is not installed or not in PATH"
@@ -170,13 +191,13 @@ if ! command -v bc &> /dev/null; then
 fi
 
 # Check kubectl access
-if ! kubectl get nodes &> /dev/null; then
+if ! kubectl_with_retry get nodes &> /dev/null; then
     echo "Error: Cannot access Kubernetes cluster. Check your kubeconfig."
     exit 1
 fi
 
 # Check metrics-server
-if ! kubectl top nodes &> /dev/null; then
+if ! kubectl_with_retry top nodes &> /dev/null; then
     echo "Error: metrics-server is not installed or not working"
     echo "Install with: kubectl apply -f https://github.com/kubernetes-metrics/metrics-server/releases/latest/download/components.yaml"
     exit 1
@@ -250,7 +271,7 @@ mi_to_gi() {
 calculate_mem_from_pods() {
     local node=$1
     
-    kubectl get pods --all-namespaces --field-selector spec.nodeName=$node -o json 2>/dev/null | \
+    kubectl_with_retry get pods --all-namespaces --field-selector spec.nodeName=$node -o json | \
         jq -r '[.items[].spec.containers[].resources.requests.memory // "0"] | 
             map(
                 if test("Ti$") then (. | rtrimstr("Ti") | tonumber * 1024)
@@ -268,7 +289,12 @@ process_node() {
     local node=$1
     
     # Get node capacity from JSON
-    local node_json=$(kubectl get node $node -o json 2>/dev/null)
+    local node_json=$(kubectl_with_retry get node $node -o json)
+    if [[ $? -ne 0 ]] || [[ -z "$node_json" ]]; then
+        # If kubectl fails, return default values
+        echo "0|$node|0m|0m|0m|0|0|0|0|0|0|0|0|0"
+        return
+    fi
     local cpu_capacity=$(echo "$node_json" | jq -r '.status.allocatable.cpu')
     local mem_capacity=$(echo "$node_json" | jq -r '.status.allocatable.memory')
     
@@ -296,18 +322,26 @@ process_node() {
     fi
     
     # Get allocated resources from describe
-    local describe=$(kubectl describe node $node 2>/dev/null)
-    local allocated=$(echo "$describe" | grep -A 10 "Allocated resources:")
-    
-    # Extract CPU line
-    local cpu_line=$(echo "$allocated" | grep "cpu" | head -1)
-    local cpu_req=$(echo "$cpu_line" | awk '{print $2}')
-    local cpu_lim=$(echo "$cpu_line" | awk '{print $4}')
-    
-    # Extract Memory line
-    local mem_line=$(echo "$allocated" | grep "memory" | head -1)
-    local mem_req_raw=$(echo "$mem_line" | awk '{print $2}')
-    local mem_lim_raw=$(echo "$mem_line" | awk '{print $4}')
+    local describe=$(kubectl_with_retry describe node $node)
+    if [[ $? -ne 0 ]] || [[ -z "$describe" ]]; then
+        # If describe fails, use default values
+        cpu_req="0m"
+        cpu_lim="0m"
+        mem_req_raw="0"
+        mem_lim_raw="0"
+    else
+        local allocated=$(echo "$describe" | grep -A 10 "Allocated resources:")
+        
+        # Extract CPU line
+        local cpu_line=$(echo "$allocated" | grep "cpu" | head -1)
+        local cpu_req=$(echo "$cpu_line" | awk '{print $2}')
+        local cpu_lim=$(echo "$cpu_line" | awk '{print $4}')
+        
+        # Extract Memory line
+        local mem_line=$(echo "$allocated" | grep "memory" | head -1)
+        local mem_req_raw=$(echo "$mem_line" | awk '{print $2}')
+        local mem_lim_raw=$(echo "$mem_line" | awk '{print $4}')
+    fi
     
     # Default values if empty
     cpu_req=${cpu_req:-0m}
@@ -331,11 +365,19 @@ process_node() {
     fi
     
     # Get actual usage from kubectl top
-    local top=$(kubectl top node $node --no-headers 2>/dev/null)
-    local cpu_use=$(echo "$top" | awk '{print $2}')
-    local cpu_use_pct=$(echo "$top" | awk '{print $3}' | tr -d '%')
-    local mem_use_mi=$(echo "$top" | awk '{print $4}')
-    local mem_use_pct=$(echo "$top" | awk '{print $5}' | tr -d '%')
+    local top=$(kubectl_with_retry top node $node --no-headers)
+    if [[ $? -ne 0 ]] || [[ -z "$top" ]]; then
+        # If top fails, use default values
+        cpu_use="0m"
+        cpu_use_pct="0"
+        mem_use_mi="0Mi"
+        mem_use_pct="0"
+    else
+        local cpu_use=$(echo "$top" | awk '{print $2}')
+        local cpu_use_pct=$(echo "$top" | awk '{print $3}' | tr -d '%')
+        local mem_use_mi=$(echo "$top" | awk '{print $4}')
+        local mem_use_pct=$(echo "$top" | awk '{print $5}' | tr -d '%')
+    fi
     
     # Default values if empty
     cpu_use=${cpu_use:-0m}
@@ -408,6 +450,7 @@ display_resources() {
     export -f to_gi
     export -f mi_to_gi
     export -f calculate_mem_from_pods
+    export -f kubectl_with_retry
     export SORT_BY
     
     # Selector for nodes
@@ -418,7 +461,7 @@ display_resources() {
     fi
     
     # Get nodes and process in parallel
-    kubectl get nodes $SELECTOR -o name 2>/dev/null | \
+    kubectl_with_retry get nodes $SELECTOR -o name | \
         sed 's|node/||' | \
         xargs -P $PARALLEL -I {} bash -c 'process_node "$@"' _ {} > $temp_file
     
@@ -472,9 +515,9 @@ display_resources() {
             
         table|*)
             # Header
-            printf "%-18s %-8s %-8s %-8s %-6s %-8s %-6s | %-8s %-8s %-8s %-6s %-8s %-6s\n" \
+            printf "%-18s %-8s %-8s %-8s %-6s %-8s %-7s | %-8s %-8s %-8s %-6s %-8s %-6s\n" \
                 "WORKER_NODE" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%"
-            echo "========================================================================================================================"
+            echo "================================================================================================================================"
             
             # Sort and display
             eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct; do
@@ -531,7 +574,7 @@ display_resources() {
                     node_display="$node"
                 fi
                 
-                printf "%-18s %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-6s${NC} | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-6s${NC}\n" \
+                printf "%-18s %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-7s${NC}   | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-6s${NC}\n" \
                     "$node_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
                     "${mem_req_display:0:8}" "${mem_lim_display:0:8}" "${mem_use_display:0:8}" "${mem_pct}%" "${mem_cap_display:0:8}" "${mem_req_pct}%"
                 
@@ -543,7 +586,7 @@ display_resources() {
             if [[ "$NO_SUM" == false ]] && [[ -f ${temp_file}.totals ]]; then
                 read total_cpu_req total_cpu_lim total_cpu_use total_cpu_cap total_mem_req total_mem_lim total_mem_use total_mem_cap node_count < ${temp_file}.totals
                 
-                echo "========================================================================================================"
+                echo "================================================================================================================================"
                 
                 # Format CPU totals
                 if [[ $total_cpu_req -ge 1000 ]]; then
@@ -570,7 +613,7 @@ display_resources() {
                 total_mem_use_fmt="${total_mem_use}Gi"
                 total_mem_cap_fmt="${total_mem_cap}Gi"
                 
-                printf "${BOLD}%-18s %-8s %-8s %-8s %-6s %-8s %-6s | %-8s %-8s %-8s %-6s %-8s %-6s${NC}\n" \
+                printf "${BOLD}%-18s %-8s %-8s %-8s %-6s %-8s %-7s   | %-8s %-8s %-8s %-6s %-8s %-6s${NC}\n" \
                     "TOTAL ($node_count)" \
                     "${total_cpu_req_fmt:0:8}" "${total_cpu_lim_fmt:0:8}" "${total_cpu_use_fmt:0:8}" "-" "${total_cpu_cap}" "-" \
                     "${total_mem_req_fmt:0:8}" "${total_mem_lim_fmt:0:8}" "${total_mem_use_fmt:0:8}" "-" "${total_mem_cap_fmt:0:8}" "-"
