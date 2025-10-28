@@ -49,11 +49,13 @@ show_help() {
     echo "    cpu-use     CPU usage"
     echo "    cpu-pct     CPU usage percentage"
     echo "    cpu-cap     CPU capacity"
+    echo "    cpu-req-pct CPU requests percentage"
     echo "    mem-req     Memory requests"
     echo "    mem-lim     Memory limits"
     echo "    mem-use     Memory usage"
     echo "    mem-pct     Memory usage percentage"
     echo "    mem-cap     Memory capacity"
+    echo "    mem-req-pct Memory requests percentage"
     echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
     echo "    ktop                        # Default: sort by CPU requests"
@@ -72,11 +74,13 @@ show_help() {
     echo "    CPU_USE        Actual CPU usage"
     echo "    CPU_%          CPU usage percentage of node capacity"
     echo "    CPU_CAP        Total CPU capacity (cores)"
+    echo "    CPU_REQ_%      CPU requests percentage of node capacity"
     echo "    MEM_REQ        Memory requests allocated to pods (Gi)"
     echo "    MEM_LIM        Memory limits allocated to pods (Gi)"
     echo "    MEM_USE        Actual memory usage (Gi)"
     echo "    MEM_%          Memory usage percentage of node capacity"
     echo "    MEM_CAP        Total memory capacity (Gi)"
+    echo "    MEM_REQ_%      Memory requests percentage of node capacity"
     echo ""
     echo -e "${BOLD}COLOR CODING:${NC}"
     echo -e "    ${GREEN}Green${NC}   0-59%  - Normal usage"
@@ -130,7 +134,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -S|--sort)
-            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|mem-req|mem-lim|mem-use|mem-pct|mem-cap)$ ]]; then
+            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct)$ ]]; then
                 echo "Error: Invalid sort field. Use 'ktop -h' to see valid options"
                 exit 1
             fi
@@ -356,6 +360,18 @@ process_node() {
     [[ "$mem_use_gi" == "ERR" ]] && mem_use_gi="0"
     [[ "$mem_total_gi" == "ERR" ]] && mem_total_gi="0"
     
+    # Calculate CPU request percentage
+    local cpu_req_pct="0"
+    if [[ "$cpu_total" != "0" ]] && [[ "$cpu_total" != "" ]]; then
+        cpu_req_pct=$(echo "scale=1; ($cpu_req_m * 100) / ($cpu_total * 1000)" | bc 2>/dev/null || echo "0")
+    fi
+    
+    # Calculate Memory request percentage
+    local mem_req_pct="0"
+    if [[ "$mem_total_gi" != "0" ]] && [[ "$mem_total_gi" != "" ]]; then
+        mem_req_pct=$(echo "scale=1; ($mem_req_gi * 100) / $mem_total_gi" | bc 2>/dev/null || echo "0")
+    fi
+    
     # Determine sort value
     local sort_value
     case "$SORT_BY" in
@@ -365,15 +381,17 @@ process_node() {
         cpu-use)    sort_value=$(printf "%010d" $cpu_use_m) ;;
         cpu-pct)    sort_value=$(printf "%010d" ${cpu_use_pct:-0}) ;;
         cpu-cap)    sort_value=$(printf "%010.1f" ${cpu_total:-0}) ;;
+        cpu-req-pct) sort_value=$(printf "%010.1f" ${cpu_req_pct:-0}) ;;
         mem-req)    sort_value=$(printf "%010.1f" ${mem_req_gi:-0}) ;;
         mem-lim)    sort_value=$(printf "%010.1f" ${mem_lim_gi:-0}) ;;
         mem-use)    sort_value=$(printf "%010.1f" ${mem_use_gi:-0}) ;;
         mem-pct)    sort_value=$(printf "%010d" ${mem_use_pct:-0}) ;;
         mem-cap)    sort_value=$(printf "%010.1f" ${mem_total_gi:-0}) ;;
+        mem-req-pct) sort_value=$(printf "%010.1f" ${mem_req_pct:-0}) ;;
         *)          sort_value=$(printf "%010d" $cpu_req_m) ;;
     esac
     
-    echo "$sort_value|$node|$cpu_req|$cpu_lim|$cpu_use|$cpu_use_pct|$cpu_total|$mem_req_gi|$mem_lim_gi|$mem_use_gi|$mem_use_pct|$mem_total_gi"
+    echo "$sort_value|$node|$cpu_req|$cpu_lim|$cpu_use|$cpu_use_pct|$cpu_total|$mem_req_gi|$mem_lim_gi|$mem_use_gi|$mem_use_pct|$mem_total_gi|$cpu_req_pct|$mem_req_pct"
 }
 
 # Main display function
@@ -429,9 +447,9 @@ display_resources() {
     # Output based on format
     case "$OUTPUT_FORMAT" in
         csv)
-            echo "NODE,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL"
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi; do
-                echo "$node,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi"
+            echo "NODE,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%"
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct; do
+                echo "$node,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%"
             done
             ;;
             
@@ -442,9 +460,9 @@ display_resources() {
             echo '  "sort_order": "'$SORT_ORDER'",'
             echo '  "nodes": ['
             first=true
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi; do
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct; do
                 [[ "$first" == false ]] && echo ","
-                echo -n '    {"name":"'$node'","cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi'}'
+                echo -n '    {"name":"'$node'","cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct'}'
                 first=false
             done
             echo ""
@@ -454,12 +472,12 @@ display_resources() {
             
         table|*)
             # Header
-            printf "%-18s %-8s %-8s %-8s %-6s %-8s | %-8s %-8s %-8s %-6s %-8s\n" \
-                "WORKER_NODE" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP"
-            echo "========================================================================================================"
+            printf "%-18s %-8s %-8s %-8s %-6s %-8s %-6s | %-8s %-8s %-8s %-6s %-8s %-6s\n" \
+                "WORKER_NODE" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%"
+            echo "========================================================================================================================"
             
             # Sort and display
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi; do
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct; do
                 # Update totals
                 cpu_req_val=${cpu_req%m}
                 cpu_lim_val=${cpu_lim%m}
@@ -513,9 +531,9 @@ display_resources() {
                     node_display="$node"
                 fi
                 
-                printf "%-18s %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s\n" \
-                    "$node_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" \
-                    "${mem_req_display:0:8}" "${mem_lim_display:0:8}" "${mem_use_display:0:8}" "${mem_pct}%" "${mem_cap_display:0:8}"
+                printf "%-18s %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-6s${NC} | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-6s${NC}\n" \
+                    "$node_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
+                    "${mem_req_display:0:8}" "${mem_lim_display:0:8}" "${mem_use_display:0:8}" "${mem_pct}%" "${mem_cap_display:0:8}" "${mem_req_pct}%"
                 
                 # Save totals to temp file
                 echo "$total_cpu_req $total_cpu_lim $total_cpu_use $total_cpu_cap $total_mem_req $total_mem_lim $total_mem_use $total_mem_cap $node_count" > ${temp_file}.totals
@@ -552,10 +570,10 @@ display_resources() {
                 total_mem_use_fmt="${total_mem_use}Gi"
                 total_mem_cap_fmt="${total_mem_cap}Gi"
                 
-                printf "${BOLD}%-18s %-8s %-8s %-8s %-6s %-8s | %-8s %-8s %-8s %-6s %-8s${NC}\n" \
+                printf "${BOLD}%-18s %-8s %-8s %-8s %-6s %-8s %-6s | %-8s %-8s %-8s %-6s %-8s %-6s${NC}\n" \
                     "TOTAL ($node_count)" \
-                    "${total_cpu_req_fmt:0:8}" "${total_cpu_lim_fmt:0:8}" "${total_cpu_use_fmt:0:8}" "-" "${total_cpu_cap}" \
-                    "${total_mem_req_fmt:0:8}" "${total_mem_lim_fmt:0:8}" "${total_mem_use_fmt:0:8}" "-" "${total_mem_cap_fmt:0:8}"
+                    "${total_cpu_req_fmt:0:8}" "${total_cpu_lim_fmt:0:8}" "${total_cpu_use_fmt:0:8}" "-" "${total_cpu_cap}" "-" \
+                    "${total_mem_req_fmt:0:8}" "${total_mem_lim_fmt:0:8}" "${total_mem_use_fmt:0:8}" "-" "${total_mem_cap_fmt:0:8}" "-"
                 
                 rm -f ${temp_file}.totals
             fi
