@@ -1,7 +1,7 @@
 ## 📊 Overview
 ktop is a powerful command-line tool for monitoring Kubernetes node resource allocation and usage. It provides a comprehensive view of CPU and memory requests, limits, actual usage, and capacity across all nodes in your cluster, similar to htop but for Kubernetes nodes.
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 
 ## ✨ Features
 Real-time Resource Monitoring: View CPU and memory requests, limits, usage, and capacity
@@ -14,6 +14,11 @@ Color-Coded Alerts: Visual indicators for resource usage levels
 - 🟢 Green: 0-59% (Normal)
 - 🟡 Yellow: 60-79% (Warning)
 - 🔴 Red: 80%+ (Critical)
+
+Node Health Status: Display node conditions (Ready, MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable)
+- 🟢 Green: Ready (healthy node)
+- 🔴 Red: NotReady (unhealthy node)
+- 🟡 Yellow: Pressure conditions detected
 
 Node Filtering: Include or exclude control-plane nodes
 Resource Totals: Summary row showing cluster-wide resource allocation
@@ -73,6 +78,12 @@ ktop -S cpu-req-pct
 # Sort by memory request percentage
 ktop -S mem-req-pct
 
+# Show detailed node conditions (Ready, MemoryPressure, etc.)
+ktop --show-conditions
+
+# Sort by node status
+ktop -S status
+
 # Watch mode - refresh every 5 seconds
 ktop -w 5
 
@@ -98,6 +109,7 @@ ktop
 | `-o, --output <fmt>` | Output format: table, csv, json | `ktop -o csv` |
 | `-S, --sort <field>` | Sort by field | `ktop -S cpu-pct` |
 | `-r, --reverse` | Reverse sort order (ascending) | `ktop -S name -r` |
+| `-c, --show-conditions` | Show detailed node conditions | `ktop --show-conditions` |
 
 ### Sort Fields
 
@@ -116,19 +128,28 @@ ktop
 | `mem-pct` | Memory usage percentage |
 | `mem-cap` | Memory capacity |
 | `mem-req-pct` | Memory request percentage of node capacity |
+| `status` | Node status/conditions |
 
 ## 📊 Output Example
 
 ```
-WORKER_NODE        CPU_REQ  CPU_LIM  CPU_USE  CPU_%  CPU_CAP  CPU_REQ_% | MEM_REQ  MEM_LIM  MEM_USE  MEM_%  MEM_CAP  MEM_REQ_%
-========================================================================================================================
-worker07           78573m   184732m  44905m   40%    111.5    70%       | 252.8Gi  301.6Gi  137.2Gi  27%    494.5Gi  51%
-worker09           77925m   168720m  35093m   31%    111.5    70%       | 146.0Gi  187.8Gi  126.8Gi  25%    494.5Gi  30%
-worker08           77075m   157220m  43008m   38%    111.5    69%       | 141.0Gi  176.0Gi  131.4Gi  26%    494.5Gi  29%
-worker-gpu-02      72161m   208884m  1206m    0%     127.5    57%       | 489.2Gi  1047.4Gi 446.5Gi  44%    993.6Gi  49%
+WORKER_NODE        STATUS      CPU_REQ  CPU_LIM  CPU_USE  CPU_%  CPU_CAP  CPU_REQ_% | MEM_REQ  MEM_LIM  MEM_USE  MEM_%  MEM_CAP  MEM_REQ_%
+========================================================================================================================================
+worker07           Ready       78573m   184732m  44905m   40%    111.5    70%       | 252.8Gi  301.6Gi  137.2Gi  27%    494.5Gi  51%
+worker09           Ready       77925m   168720m  35093m   31%    111.5    70%       | 146.0Gi  187.8Gi  126.8Gi  25%    494.5Gi  30%
+worker08           Ready       77075m   157220m  43008m   38%    111.5    69%       | 141.0Gi  176.0Gi  131.4Gi  26%    494.5Gi  29%
+worker-gpu-02      Ready       72161m   208884m  1206m    0%     127.5    57%       | 489.2Gi  1047.4Gi 446.5Gi  44%    993.6Gi  49%
 ...
-========================================================================================================================
-TOTAL (58)         3272.9   7225.0   1552.4   -      5018.8   -        | 8117.2Gi 12621.0Gi 7869.1Gi -     22998.8Gi -
+========================================================================================================================================
+TOTAL (58)         -           3272.9   7225.0   1552.4   -      5018.8   -        | 8117.2Gi 12621.0Gi 7869.1Gi -     22998.8Gi -
+```
+
+With `--show-conditions`, the STATUS column shows detailed condition information:
+```
+WORKER_NODE        STATUS          CPU_REQ  ...
+worker01           Ready           78573m   ...
+worker02           Ready(Mem,Disk) 77925m   ...  # Node has MemoryPressure and DiskPressure
+worker03           NotReady        77075m   ...
 ```
 
 ### Output Columns
@@ -146,6 +167,14 @@ TOTAL (58)         3272.9   7225.0   1552.4   -      5018.8   -        | 8117.2G
 - **MEM_%**: Memory usage percentage of node capacity
 - **MEM_CAP**: Total memory capacity (Gi)
 - **MEM_REQ_%**: Memory request percentage of node capacity
+- **STATUS**: Node health status
+  - **Ready**: Node is healthy and ready to accept pods
+  - **NotReady**: Node is not ready (may be cordoned, draining, or unhealthy)
+  - **Ready(Mem)**: Node is ready but has MemoryPressure
+  - **Ready(Disk)**: Node is ready but has DiskPressure
+  - **Ready(PID)**: Node is ready but has PIDPressure
+  - **Ready(Net)**: Node is ready but NetworkUnavailable condition is True
+  - Multiple conditions can appear together, e.g., `Ready(Mem,Disk)`
 
 
 ### Export and Analysis
@@ -211,6 +240,9 @@ export KTOP_WATCH=0
 
 # Set default sort field
 export KTOP_SORT=cpu-req
+
+# Show node conditions by default
+export KTOP_SHOW_CONDITIONS=true
 
 # Enable verbose mode (shows configuration info)
 export KTOP_VERBOSE=true

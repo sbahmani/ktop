@@ -1,0 +1,19 @@
+# Feature suggestions document (generated/working document)
+FEATURE_SUGGESTIONS.md
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+

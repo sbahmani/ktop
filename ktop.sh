@@ -13,10 +13,10 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # Version information
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # Default settings (can be overridden by environment variables)
-PARALLEL=${KTOP_PARALLEL:-4}
+PARALLEL=${KTOP_PARALLEL:-8}
 OUTPUT_FORMAT=${KTOP_FORMAT:-"table"}
 SHOW_ALL=${KTOP_ALL:-false}
 NO_COLOR=${KTOP_NO_COLOR:-false}
@@ -24,6 +24,7 @@ NO_SUM=${KTOP_NO_SUM:-false}
 WATCH_INTERVAL=${KTOP_WATCH:-0}
 SORT_BY=${KTOP_SORT:-"cpu-req"}  # Default sort by CPU requests
 SORT_ORDER="desc"  # Default descending order
+SHOW_CONDITIONS=${KTOP_SHOW_CONDITIONS:-false}  # Show detailed node conditions
 
 # Help function
 show_help() {
@@ -37,18 +38,19 @@ show_help() {
     echo "    Shows resource requests, limits, actual usage, percentages, and total capacity."
     echo ""
     echo -e "${BOLD}ENVIRONMENT VARIABLES:${NC}"
-    echo "    KTOP_PARALLEL    Number of parallel queries (default: 4)"
+    echo "    KTOP_PARALLEL    Number of parallel queries (default: 8)"
     echo "    KTOP_FORMAT      Output format: table, csv, json (default: table)"
     echo "    KTOP_ALL         Include control-plane nodes (default: false)"
     echo "    KTOP_NO_COLOR    Disable color output (default: false)"
     echo "    KTOP_NO_SUM      Don't show summary totals (default: false)"
     echo "    KTOP_WATCH       Auto-refresh interval in seconds (default: 0)"
     echo "    KTOP_SORT        Default sort field (default: cpu-req)"
+    echo "    KTOP_SHOW_CONDITIONS  Show detailed node conditions (default: false)"
     echo ""
     echo -e "${BOLD}OPTIONS:${NC}"
     echo "    -h, --help          Show this help message"
     echo "    -v, --version       Show version information"
-    echo "    -P <num>            Number of parallel kubectl queries (default: 4)"
+    echo "    -P <num>            Number of parallel kubectl queries (default: 8)"
     echo "    -a, --all           Include control-plane nodes"
     echo "    -n, --no-color      Disable color output"
     echo "    -s, --no-sum        Don't show summary totals"
@@ -56,6 +58,7 @@ show_help() {
     echo "    -o, --output <fmt>  Output format: table (default), csv, json"
     echo "    -S, --sort <field>  Sort by field (default: cpu-req)"
     echo "    -r, --reverse       Reverse sort order (ascending)"
+    echo "    -c, --show-conditions  Show detailed node conditions (Ready, MemoryPressure, etc.)"
     echo ""
     echo -e "${BOLD}SORT FIELDS:${NC}"
     echo "    name        Node name (alphabetical)"
@@ -71,6 +74,7 @@ show_help() {
     echo "    mem-pct     Memory usage percentage"
     echo "    mem-cap     Memory capacity"
     echo "    mem-req-pct Memory requests percentage"
+    echo "    status      Node status/conditions"
     echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
     echo "    ktop                        # Default: sort by CPU requests"
@@ -96,11 +100,18 @@ show_help() {
     echo "    MEM_%          Memory usage percentage of node capacity"
     echo "    MEM_CAP        Total memory capacity (Gi)"
     echo "    MEM_REQ_%      Memory requests percentage of node capacity"
+    echo "    STATUS         Node health status (Ready/NotReady and conditions)"
     echo ""
     echo -e "${BOLD}COLOR CODING:${NC}"
     echo -e "    ${GREEN}Green${NC}   0-59%  - Normal usage"
     echo -e "    ${YELLOW}Yellow${NC}  60-79% - Medium usage"
     echo -e "    ${RED}Red${NC}     80%+   - High usage"
+    echo ""
+    echo -e "${BOLD}NODE STATUS:${NC}"
+    echo -e "    ${GREEN}Ready${NC}        Node is healthy and ready"
+    echo -e "    ${RED}NotReady${NC}      Node is not ready"
+    echo -e "    ${YELLOW}Pressure${NC}      Node has resource pressure (Memory/Disk/PID)"
+    echo "    Use --show-conditions to see detailed condition information"
     echo ""
 }
 
@@ -153,7 +164,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -S|--sort)
-            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct)$ ]]; then
+            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|status)$ ]]; then
                 echo "Error: Invalid sort field. Use 'ktop -h' to see valid options"
                 exit 1
             fi
@@ -162,6 +173,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -r|--reverse)
             SORT_ORDER="asc"
+            shift
+            ;;
+        -c|--show-conditions)
+            SHOW_CONDITIONS=true
             shift
             ;;
         *)
@@ -179,6 +194,7 @@ kubectl_with_retry() {
     local delay=2
     local output
     local error_output
+    local quiet_mode=${KTOP_QUIET_RETRY:-false}
     
     while [[ $retry_count -lt $max_retries ]]; do
         if output=$(kubectl "$@" 2>/dev/null); then
@@ -190,8 +206,22 @@ kubectl_with_retry() {
         
         retry_count=$((retry_count + 1))
         if [[ $retry_count -lt $max_retries ]]; then
-            # Only show retry message for non-critical errors
-            if [[ "$*" != *"get nodes"* ]] && [[ "$*" != *"top nodes"* ]]; then
+            # Suppress retry warnings for:
+            # - Node-level operations (get node, describe node, top node)
+            # - Pod operations during parallel processing
+            # - When in quiet mode
+            local suppress_warning=false
+            if [[ "$quiet_mode" == "true" ]] || \
+               [[ "$*" == *"get nodes"* ]] || \
+               [[ "$*" == *"top nodes"* ]] || \
+               [[ "$*" == *"get node"* ]] || \
+               [[ "$*" == *"describe node"* ]] || \
+               [[ "$*" == *"top node"* ]] || \
+               [[ "$*" == *"get pods"* ]]; then
+                suppress_warning=true
+            fi
+            
+            if [[ "$suppress_warning" == "false" ]]; then
                 echo "Warning: kubectl command failed, retrying in ${delay}s... (attempt ${retry_count}/${max_retries})" >&2
             fi
             sleep $delay
@@ -199,8 +229,19 @@ kubectl_with_retry() {
         fi
     done
     
-    # Store error for debugging if needed
-    echo "Error: kubectl command failed after ${max_retries} attempts: $error_output" >&2
+    # Only show final error if it's a critical operation or not in quiet mode
+    local suppress_error=false
+    if [[ "$quiet_mode" == "true" ]] || \
+       [[ "$*" == *"get node"* ]] || \
+       [[ "$*" == *"describe node"* ]] || \
+       [[ "$*" == *"top node"* ]] || \
+       [[ "$*" == *"get pods"* ]]; then
+        suppress_error=true
+    fi
+    
+    if [[ "$suppress_error" == "false" ]]; then
+        echo "Error: kubectl command failed after ${max_retries} attempts: $error_output" >&2
+    fi
     return 1
 }
 
@@ -208,8 +249,8 @@ kubectl_with_retry() {
 validate_env_vars() {
     # Validate PARALLEL
     if [[ ! "$PARALLEL" =~ ^[0-9]+$ ]] || [[ "$PARALLEL" -lt 1 ]] || [[ "$PARALLEL" -gt 50 ]]; then
-        echo "Warning: Invalid KTOP_PARALLEL value '$PARALLEL', using default 4"
-        PARALLEL=4
+        echo "Warning: Invalid KTOP_PARALLEL value '$PARALLEL', using default 8"
+        PARALLEL=8
     fi
     
     # Validate OUTPUT_FORMAT
@@ -241,9 +282,15 @@ validate_env_vars() {
     fi
     
     # Validate SORT_BY
-    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct)$ ]]; then
+    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|status)$ ]]; then
         echo "Warning: Invalid KTOP_SORT value '$SORT_BY', using default 'cpu-req'"
         SORT_BY="cpu-req"
+    fi
+    
+    # Validate boolean variables
+    if [[ "$SHOW_CONDITIONS" != "true" ]] && [[ "$SHOW_CONDITIONS" != "false" ]]; then
+        echo "Warning: Invalid KTOP_SHOW_CONDITIONS value '$SHOW_CONDITIONS', using default 'false'"
+        SHOW_CONDITIONS=false
     fi
 }
 
@@ -345,7 +392,7 @@ mi_to_gi() {
     fi
 }
 
-# Function to calculate memory from pods
+# Function to calculate memory requests from pods
 calculate_mem_from_pods() {
     local node=$1
     
@@ -362,19 +409,119 @@ calculate_mem_from_pods() {
         awk '{printf "%.1f", $1}'
 }
 
+# Function to calculate memory limits from pods
+calculate_mem_limits_from_pods() {
+    local node=$1
+    
+    kubectl_with_retry get pods --all-namespaces --field-selector spec.nodeName=$node -o json | \
+        jq -r '[.items[].spec.containers[].resources.limits.memory // "0"] | 
+            map(
+                if test("Ti$") then (. | rtrimstr("Ti") | tonumber * 1024)
+                elif test("Gi$") then (. | rtrimstr("Gi") | tonumber)
+                elif test("Mi$") then (. | rtrimstr("Mi") | tonumber / 1024)
+                elif test("Ki$") then (. | rtrimstr("Ki") | tonumber / 1024 / 1024)
+                elif test("^[0-9]+$") then (. | tonumber / 1024 / 1024 / 1024)
+                else 0 end
+            ) | add // 0' | \
+        awk '{printf "%.1f", $1}'
+}
+
+# Function to get node conditions and status
+get_node_status() {
+    local node_json=$1
+    local ready_status="Unknown"
+    local conditions_summary=""
+    local status_code=0  # 0=Ready, 1=NotReady, 2=Pressure
+    
+    # Get all conditions in one jq call (faster than multiple calls)
+    local conditions=$(echo "$node_json" | jq -r '.status.conditions[] | "\(.type)|\(.status)"' 2>/dev/null)
+    
+    # Get Ready condition
+    local ready_condition=$(echo "$conditions" | grep "^Ready|" | cut -d'|' -f2)
+    
+    if [[ "$ready_condition" == "True" ]]; then
+        ready_status="Ready"
+        status_code=0
+    elif [[ "$ready_condition" == "False" ]]; then
+        ready_status="NotReady"
+        status_code=1
+    else
+        ready_status="Unknown"
+        status_code=1
+    fi
+    
+    # Check for pressure conditions if showing detailed conditions
+    if [[ "$SHOW_CONDITIONS" == "true" ]]; then
+        local pressures=()
+        
+        # Use pre-parsed conditions data (faster than multiple jq calls)
+        local mem_pressure=$(echo "$conditions" | grep "^MemoryPressure|" | cut -d'|' -f2)
+        if [[ "$mem_pressure" == "True" ]]; then
+            pressures+=("Mem")
+            status_code=2
+        fi
+        
+        local disk_pressure=$(echo "$conditions" | grep "^DiskPressure|" | cut -d'|' -f2)
+        if [[ "$disk_pressure" == "True" ]]; then
+            pressures+=("Disk")
+            status_code=2
+        fi
+        
+        local pid_pressure=$(echo "$conditions" | grep "^PIDPressure|" | cut -d'|' -f2)
+        if [[ "$pid_pressure" == "True" ]]; then
+            pressures+=("PID")
+            status_code=2
+        fi
+        
+        local net_unavailable=$(echo "$conditions" | grep "^NetworkUnavailable|" | cut -d'|' -f2)
+        if [[ "$net_unavailable" == "True" ]]; then
+            pressures+=("Net")
+            status_code=2
+        fi
+        
+        # Build conditions summary
+        if [[ ${#pressures[@]} -gt 0 ]]; then
+            conditions_summary="${ready_status}($(IFS=','; echo "${pressures[*]}"))"
+        else
+            conditions_summary="$ready_status"
+        fi
+    else
+        conditions_summary="$ready_status"
+    fi
+    
+    echo "$status_code|$conditions_summary"
+}
+
 # Process function
 process_node() {
     local node=$1
     
-    # Get node capacity from JSON
-    local node_json=$(kubectl_with_retry get node $node -o json)
-    if [[ $? -ne 0 ]] || [[ -z "$node_json" ]]; then
+    # Extract node JSON from pre-fetched all nodes data file (much faster than per-node query)
+    local node_json=""
+    if [[ -n "$NODES_JSON_FILE" ]] && [[ -f "$NODES_JSON_FILE" ]]; then
+        node_json=$(jq -r --arg node "$node" '.items[] | select(.metadata.name == $node)' "$NODES_JSON_FILE" 2>/dev/null)
+    fi
+    
+    # Fallback to per-node query if not found in batch data
+    if [[ -z "$node_json" ]] || [[ "$node_json" == "null" ]]; then
+        node_json=$(kubectl_with_retry get node $node -o json 2>/dev/null)
+    fi
+    
+    if [[ -z "$node_json" ]] || [[ "$node_json" == "null" ]]; then
         # If kubectl fails, return default values
-        echo "0|$node|0m|0m|0m|0|0|0|0|0|0|0|0|0"
+        echo "0|$node|0m|0m|0m|0|0|0|0|0|0|0|0|0|1|Unknown"
         return
     fi
-    local cpu_capacity=$(echo "$node_json" | jq -r '.status.allocatable.cpu')
-    local mem_capacity=$(echo "$node_json" | jq -r '.status.allocatable.memory')
+    
+    # Get node status and conditions
+    local status_info=$(get_node_status "$node_json")
+    local status_code=$(echo "$status_info" | cut -d'|' -f1)
+    local status_text=$(echo "$status_info" | cut -d'|' -f2)
+    
+    # Extract capacity data in one jq call (faster than multiple calls)
+    local capacity_data=$(echo "$node_json" | jq -r '.status.allocatable | "\(.cpu)|\(.memory)"' 2>/dev/null)
+    local cpu_capacity=$(echo "$capacity_data" | cut -d'|' -f1)
+    local mem_capacity=$(echo "$capacity_data" | cut -d'|' -f2)
     
     # Convert CPU capacity to cores
     local cpu_total
@@ -400,11 +547,12 @@ process_node() {
     fi
     
     # Get allocated resources from describe
-    local describe=$(kubectl_with_retry describe node $node)
+    # Note: Allocated resources are not stored in node JSON, only in describe output
+    local describe=$(kubectl_with_retry describe node $node 2>/dev/null)
     if [[ $? -ne 0 ]] || [[ -z "$describe" ]]; then
         # If describe fails, use default values
-        cpu_req="0m"
-        cpu_lim="0m"
+        cpu_req_raw="0m"
+        cpu_lim_raw="0m"
         mem_req_raw="0"
         mem_lim_raw="0"
     else
@@ -412,18 +560,18 @@ process_node() {
         
         # Extract CPU line
         local cpu_line=$(echo "$allocated" | grep "cpu" | head -1)
-        local cpu_req=$(echo "$cpu_line" | awk '{print $2}')
-        local cpu_lim=$(echo "$cpu_line" | awk '{print $4}')
+        cpu_req_raw=$(echo "$cpu_line" | awk '{print $2}')
+        cpu_lim_raw=$(echo "$cpu_line" | awk '{print $4}')
         
         # Extract Memory line
         local mem_line=$(echo "$allocated" | grep "memory" | head -1)
-        local mem_req_raw=$(echo "$mem_line" | awk '{print $2}')
-        local mem_lim_raw=$(echo "$mem_line" | awk '{print $4}')
+        mem_req_raw=$(echo "$mem_line" | awk '{print $2}')
+        mem_lim_raw=$(echo "$mem_line" | awk '{print $4}')
     fi
     
     # Default values if empty
-    cpu_req=${cpu_req:-0m}
-    cpu_lim=${cpu_lim:-0m}
+    cpu_req=${cpu_req_raw:-0m}
+    cpu_lim=${cpu_lim_raw:-0m}
     mem_req_raw=${mem_req_raw:-0}
     mem_lim_raw=${mem_lim_raw:-0}
     
@@ -437,24 +585,37 @@ process_node() {
     
     # Convert memory limit to Gi
     local mem_lim_gi=$(to_gi "$mem_lim_raw")
+    
+    # Only calculate from pods if the conversion resulted in an error (corrupted data)
+    # If limit is 0, that's likely accurate - many pods don't set memory limits in Kubernetes
+    # This avoids expensive pod queries for every node
     if [[ "$mem_lim_gi" == "ERR" ]]; then
-        # If limit is corrupted, use a reasonable default or calculate
-        mem_lim_gi="0"
+        # Corrupted data - try to calculate from pods as fallback
+        mem_lim_gi=$(calculate_mem_limits_from_pods "$node")
+        [[ -z "$mem_lim_gi" ]] && mem_lim_gi="0"
     fi
     
-    # Get actual usage from kubectl top
-    local top=$(kubectl_with_retry top node $node --no-headers)
-    if [[ $? -ne 0 ]] || [[ -z "$top" ]]; then
-        # If top fails, use default values
-        cpu_use="0m"
-        cpu_use_pct="0"
-        mem_use_mi="0Mi"
-        mem_use_pct="0"
+    # Get actual usage from pre-fetched top data (much faster than per-node query)
+    local top_line=$(echo "$TOP_DATA" | grep "^$node " | head -1)
+    if [[ -n "$top_line" ]]; then
+        local cpu_use=$(echo "$top_line" | awk '{print $2}')
+        local cpu_use_pct=$(echo "$top_line" | awk '{print $3}' | tr -d '%')
+        local mem_use_mi=$(echo "$top_line" | awk '{print $4}')
+        local mem_use_pct=$(echo "$top_line" | awk '{print $5}' | tr -d '%')
     else
-        local cpu_use=$(echo "$top" | awk '{print $2}')
-        local cpu_use_pct=$(echo "$top" | awk '{print $3}' | tr -d '%')
-        local mem_use_mi=$(echo "$top" | awk '{print $4}')
-        local mem_use_pct=$(echo "$top" | awk '{print $5}' | tr -d '%')
+        # Fallback to per-node query if not in batch data
+        local top=$(kubectl_with_retry top node $node --no-headers 2>/dev/null)
+        if [[ -n "$top" ]]; then
+            cpu_use=$(echo "$top" | awk '{print $2}')
+            cpu_use_pct=$(echo "$top" | awk '{print $3}' | tr -d '%')
+            mem_use_mi=$(echo "$top" | awk '{print $4}')
+            mem_use_pct=$(echo "$top" | awk '{print $5}' | tr -d '%')
+        else
+            cpu_use="0m"
+            cpu_use_pct="0"
+            mem_use_mi="0Mi"
+            mem_use_pct="0"
+        fi
     fi
     
     # Default values if empty
@@ -508,10 +669,11 @@ process_node() {
         mem-pct)    sort_value=$(printf "%010d" ${mem_use_pct:-0}) ;;
         mem-cap)    sort_value=$(printf "%010.1f" ${mem_total_gi:-0}) ;;
         mem-req-pct) sort_value=$(printf "%010.1f" ${mem_req_pct:-0}) ;;
+        status)     sort_value=$(printf "%010d" $status_code) ;;
         *)          sort_value=$(printf "%010d" $cpu_req_m) ;;
     esac
     
-    echo "$sort_value|$node|$cpu_req|$cpu_lim|$cpu_use|$cpu_use_pct|$cpu_total|$mem_req_gi|$mem_lim_gi|$mem_use_gi|$mem_use_pct|$mem_total_gi|$cpu_req_pct|$mem_req_pct"
+    echo "$sort_value|$node|$cpu_req|$cpu_lim|$cpu_use|$cpu_use_pct|$cpu_total|$mem_req_gi|$mem_lim_gi|$mem_use_gi|$mem_use_pct|$mem_total_gi|$cpu_req_pct|$mem_req_pct|$status_code|$status_text"
 }
 
 # Main display function
@@ -533,8 +695,14 @@ display_resources() {
     export -f to_gi
     export -f mi_to_gi
     export -f calculate_mem_from_pods
+    export -f calculate_mem_limits_from_pods
     export -f kubectl_with_retry
+    export -f get_node_status
     export SORT_BY
+    export SHOW_CONDITIONS
+    export KTOP_QUIET_RETRY=true  # Suppress retry warnings during parallel processing
+    export TOP_DATA  # Pre-fetched top data for all nodes
+    export NODES_JSON_FILE  # Temp file with pre-fetched JSON for all nodes
     
     # Selector for nodes
     if [[ "$SHOW_ALL" == true ]]; then
@@ -543,10 +711,22 @@ display_resources() {
         SELECTOR="--selector=!node-role.kubernetes.io/control-plane"
     fi
     
+    # Get all node usage data at once (much faster than per-node queries)
+    local top_data=$(kubectl_with_retry top nodes $SELECTOR --no-headers 2>/dev/null)
+    export TOP_DATA="$top_data"
+    
+    # Get all nodes JSON at once and save to temp file (avoids "argument list too long" error)
+    local nodes_json_file=$(mktemp)
+    kubectl_with_retry get nodes $SELECTOR -o json > "$nodes_json_file" 2>/dev/null
+    export NODES_JSON_FILE="$nodes_json_file"
+    
     # Get nodes and process in parallel
     kubectl_with_retry get nodes $SELECTOR -o name | \
         sed 's|node/||' | \
         xargs -P $PARALLEL -I {} bash -c 'process_node "$@"' _ {} > $temp_file
+    
+    # Clean up nodes JSON temp file
+    rm -f "$nodes_json_file"
     
     # Initialize totals
     total_cpu_req=0
@@ -573,9 +753,9 @@ display_resources() {
     # Output based on format
     case "$OUTPUT_FORMAT" in
         csv)
-            echo "NODE,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%"
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct; do
-                echo "$node,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%"
+            echo "NODE,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%,STATUS"
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text; do
+                echo "$node,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%,$status_text"
             done
             ;;
             
@@ -586,9 +766,9 @@ display_resources() {
             echo '  "sort_order": "'$SORT_ORDER'",'
             echo '  "nodes": ['
             first=true
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct; do
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text; do
                 [[ "$first" == false ]] && echo ","
-                echo -n '    {"name":"'$node'","cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct'}'
+                echo -n '    {"name":"'$node'","cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct',"status":"'$status_text'","status_code":'$status_code'}'
                 first=false
             done
             echo ""
@@ -598,12 +778,12 @@ display_resources() {
             
         table|*)
             # Header
-            printf "%-18s %-8s %-8s %-8s %-6s %-8s %-7s | %-8s %-8s %-8s %-6s %-8s %-6s\n" \
-                "WORKER_NODE" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%"
-            echo "================================================================================================================================"
+            printf "%-24s    %-10s %-8s %-8s %-8s %-6s %-8s %-7s | %-8s %-8s %-8s %-6s %-8s %-6s\n" \
+                "WORKER_NODE" "STATUS" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%"
+            echo "===================================================================================================================================================="
             
             # Sort and display
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct; do
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text; do
                 # Update totals
                 cpu_req_val=${cpu_req%m}
                 cpu_lim_val=${cpu_lim%m}
@@ -622,7 +802,7 @@ display_resources() {
                 total_mem_cap=$(echo "$total_mem_cap + $mem_total_gi" | bc 2>/dev/null || echo $total_mem_cap)
                 node_count=$((node_count + 1))
                 
-                # Color code percentages
+                # Color code percentages and status
                 if [[ "$NO_COLOR" == false ]]; then
                     if [[ ${cpu_pct%.*} -ge 80 ]]; then
                         cpu_color="${RED}"
@@ -639,9 +819,21 @@ display_resources() {
                     else
                         mem_color="${GREEN}"
                     fi
+                    
+                    # Color code status
+                    if [[ "$status_code" == "0" ]]; then
+                        status_color="${GREEN}"
+                    elif [[ "$status_code" == "1" ]]; then
+                        status_color="${RED}"
+                    elif [[ "$status_code" == "2" ]]; then
+                        status_color="${YELLOW}"
+                    else
+                        status_color=""
+                    fi
                 else
                     cpu_color=""
                     mem_color=""
+                    status_color=""
                 fi
                 
                 # Format display values
@@ -650,15 +842,22 @@ display_resources() {
                 mem_use_display="${mem_use_gi}Gi"
                 mem_cap_display="${mem_total_gi}Gi"
                 
-                # Truncate node name if too long
-                if [[ ${#node} -gt 18 ]]; then
-                    node_display="${node:0:17}.."
+                # Truncate node name if too long (24 char column: 22 chars + ".." = 24)
+                if [[ ${#node} -gt 24 ]]; then
+                    node_display="${node:0:22}.."
                 else
                     node_display="$node"
                 fi
                 
-                printf "%-18s %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-7s${NC}   | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-6s${NC}\n" \
-                    "$node_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
+                # Truncate status text if too long
+                if [[ ${#status_text} -gt 10 ]]; then
+                    status_display="${status_text:0:9}.."
+                else
+                    status_display="$status_text"
+                fi
+                
+                printf "%-24s    ${status_color}%-10s${NC} %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-7s${NC}   | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-6s${NC}\n" \
+                    "$node_display" "$status_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
                     "${mem_req_display:0:8}" "${mem_lim_display:0:8}" "${mem_use_display:0:8}" "${mem_pct}%" "${mem_cap_display:0:8}" "${mem_req_pct}%"
                 
                 # Save totals to temp file
@@ -669,7 +868,7 @@ display_resources() {
             if [[ "$NO_SUM" == false ]] && [[ -f ${temp_file}.totals ]]; then
                 read total_cpu_req total_cpu_lim total_cpu_use total_cpu_cap total_mem_req total_mem_lim total_mem_use total_mem_cap node_count < ${temp_file}.totals
                 
-                echo "================================================================================================================================"
+                echo "===================================================================================================================================================="
                 
                 # Format CPU totals
                 if [[ $total_cpu_req -ge 1000 ]]; then
@@ -696,8 +895,8 @@ display_resources() {
                 total_mem_use_fmt="${total_mem_use}Gi"
                 total_mem_cap_fmt="${total_mem_cap}Gi"
                 
-                printf "${BOLD}%-18s %-8s %-8s %-8s %-6s %-8s %-7s   | %-8s %-8s %-8s %-6s %-8s %-6s${NC}\n" \
-                    "TOTAL ($node_count)" \
+                printf "${BOLD}%-24s    %-10s %-8s %-8s %-8s %-6s %-8s %-7s   | %-8s %-8s %-8s %-6s %-8s %-6s${NC}\n" \
+                    "TOTAL ($node_count)" "-" \
                     "${total_cpu_req_fmt:0:8}" "${total_cpu_lim_fmt:0:8}" "${total_cpu_use_fmt:0:8}" "-" "${total_cpu_cap}" "-" \
                     "${total_mem_req_fmt:0:8}" "${total_mem_lim_fmt:0:8}" "${total_mem_use_fmt:0:8}" "-" "${total_mem_cap_fmt:0:8}" "-"
                 
