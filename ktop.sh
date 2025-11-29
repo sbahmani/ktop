@@ -77,8 +77,7 @@ show_help() {
     echo "    disk-use    Disk usage"
     echo "    disk-cap    Disk capacity"
     echo "    disk-pct    Disk usage percentage"
-    echo "    pods        Total pod count"
-    echo "    pods-ready  Ready pod count"
+    echo "    pods        Pod count (ready/total)"
     echo "    status      Node status/conditions"
     echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
@@ -94,8 +93,7 @@ show_help() {
     echo -e "${BOLD}OUTPUT COLUMNS:${NC}"
     echo "    WORKER_NODE    Node name"
     echo "    STATUS         Node health status (Ready/NotReady and conditions)"
-    echo "    PODS           Total number of pods on the node"
-    echo "    PODS_READY     Ready pods (format: ready/total)"
+    echo "    PODS          Pod count (format: ready/total)"
     echo "    CPU_REQ        CPU requests allocated to pods"
     echo "    CPU_LIM        CPU limits allocated to pods"
     echo "    CPU_USE        Actual CPU usage"
@@ -174,7 +172,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -S|--sort)
-            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|disk-use|disk-cap|disk-pct|pods|pods-ready|status)$ ]]; then
+            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|disk-use|disk-cap|disk-pct|pods|status)$ ]]; then
                 echo "Error: Invalid sort field. Use 'ktop -h' to see valid options"
                 exit 1
             fi
@@ -292,7 +290,7 @@ validate_env_vars() {
     fi
     
     # Validate SORT_BY
-    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|disk-use|disk-cap|disk-pct|pods|pods-ready|status)$ ]]; then
+    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|disk-use|disk-cap|disk-pct|pods|status)$ ]]; then
         echo "Warning: Invalid KTOP_SORT value '$SORT_BY', using default 'cpu-req'"
         SORT_BY="cpu-req"
     fi
@@ -864,7 +862,7 @@ process_node() {
         disk-cap)   sort_value=$(printf "%010.1f" ${disk_total_gi:-0}) ;;
         disk-pct)   sort_value=$(printf "%010.1f" ${disk_use_pct:-0}) ;;
         pods)       sort_value=$(printf "%010d" ${total_pods:-0}) ;;
-        pods-ready) sort_value=$(printf "%010d" ${ready_pods:-0}) ;;
+        pods) sort_value=$(printf "%010d" ${ready_pods:-0}) ;;
         status)     sort_value=$(printf "%010d" $status_code) ;;
         *)          sort_value=$(printf "%010d" $cpu_req_m) ;;
     esac
@@ -957,14 +955,14 @@ display_resources() {
     # Output based on format
     case "$OUTPUT_FORMAT" in
         csv)
-            echo "NODE,STATUS,PODS,PODS_READY,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%,DISK_USE,DISK_CAP,DISK_%,DISK_REQ"
+            echo "NODE,STATUS,PODS,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%,DISK_USE,DISK_CAP,DISK_%,DISK_REQ"
             eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods disk_use_gi disk_total_gi disk_use_pct disk_req_gi; do
                 if [[ "$node_pods" == "0" ]]; then
                     pods_ready_display="0/0"
                 else
                     pods_ready_display="${node_ready_pods}/${node_pods}"
                 fi
-                echo "$node,$status_text,$node_pods,$pods_ready_display,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%,${disk_use_gi}Gi,${disk_total_gi}Gi,$disk_use_pct%,${disk_req_gi}Gi"
+                echo "$node,$status_text,$pods_ready_display,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%,${disk_use_gi}Gi,${disk_total_gi}Gi,$disk_use_pct%,${disk_req_gi}Gi"
             done
             ;;
             
@@ -977,7 +975,7 @@ display_resources() {
             first=true
             eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods disk_use_gi disk_total_gi disk_use_pct disk_req_gi; do
                 [[ "$first" == false ]] && echo ","
-                echo -n '    {"name":"'$node'","status":"'$status_text'","status_code":'$status_code',"pods":'$node_pods',"pods_ready":'$node_ready_pods',"cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct',"disk_use_gi":'$disk_use_gi',"disk_cap_gi":'$disk_total_gi',"disk_pct":'$disk_use_pct',"disk_req_gi":'$disk_req_gi'}'
+                echo -n '    {"name":"'$node'","status":"'$status_text'","status_code":'$status_code',"pods":'$node_ready_pods',"cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct',"disk_use_gi":'$disk_use_gi',"disk_cap_gi":'$disk_total_gi',"disk_pct":'$disk_use_pct',"disk_req_gi":'$disk_req_gi'}'
                 first=false
             done
             echo ""
@@ -989,9 +987,9 @@ display_resources() {
             # Header - format must account for header text lengths (CPU_REQ_% and MEM_REQ_% are 9 chars)
             # Use wider format for percentage columns to accommodate header text
             # DISK_CAP needs 9 chars to accommodate values like "17811.2Gi"
-            printf "%-24s    %-10s %-6s %-10s   | %-8s %-8s %-8s %-6s %-8s %-9s   | %-8s %-8s %-8s %-6s %-8s %-9s   | %-8s %-9s %-6s\n" \
-                "WORKER_NODE" "STATUS" "PODS" "PODS_READY" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%" "DISK_USE" "DISK_CAP" "DISK_%"
-                echo "==========================================================================================================================================================================================================="
+            printf "%-24s%-10s%-10s| %-8s %-8s %-8s %-6s %-8s %-9s | %-8s %-8s %-8s %-6s %-8s %-9s | %-8s %-9s %-6s\n" \
+                "WORKER_NODE" "STATUS" "PODS" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%" "DISK_USE" "DISK_CAP" "DISK_%"
+                echo "====================================================================================================================================================================================="
             
             # Sort and display
             eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods disk_use_gi disk_total_gi disk_use_pct disk_req_gi; do
@@ -1097,8 +1095,8 @@ display_resources() {
                     status_display="$status_text"
                 fi
                 
-                printf "%-24s    ${status_color}%-10s${NC} %-6s %-10s   | %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-9s${NC}   | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-9s${NC}   | %-8s %-9s ${disk_color}%-6s${NC}\n" \
-                    "$node_display" "$status_display" "$pods_display" "$pods_ready_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
+                printf "%-24s${status_color}%-10s${NC}%-10s| %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-9s${NC} | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-9s${NC} | %-8s %-9s ${disk_color}%-6s${NC}\n" \
+                    "$node_display" "$status_display" "$pods_ready_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
                     "${mem_req_display:0:8}" "${mem_lim_display:0:8}" "${mem_use_display:0:8}" "${mem_pct}%" "${mem_cap_display:0:8}" "${mem_req_pct}%" \
                     "${disk_use_display:0:8}" "${disk_cap_display:0:9}" "${disk_use_pct}%"
             done
@@ -1107,7 +1105,7 @@ display_resources() {
             if [[ "$NO_SUM" == false ]] && [[ -f ${temp_file}.totals ]]; then
                 read total_cpu_req total_cpu_lim total_cpu_use total_cpu_cap total_mem_req total_mem_lim total_mem_use total_mem_cap total_disk_use total_disk_cap total_disk_req total_pods total_ready_pods node_count < ${temp_file}.totals
                 
-                echo "=========================================================================================================================================================================================================="
+                echo "====================================================================================================================================================================================="
                 
                 # Format CPU totals
                 if [[ $total_cpu_req -ge 1000 ]]; then
@@ -1146,8 +1144,8 @@ display_resources() {
                     total_pods_ready_display="${total_ready_pods}/${total_pods}"
                 fi
                 
-                printf "${BOLD}%-24s    %-10s %-6s %-10s   | %-8s %-8s %-8s %-6s %-8s %-9s   | %-8s %-8s %-8s %-6s %-8s %-9s   | %-8s %-9s %-6s${NC}\n" \
-                    "TOTAL ($node_count)" "-" "$total_pods_display" "$total_pods_ready_display" \
+                printf "${BOLD}%-24s%-10s%-10s| %-8s %-8s %-8s %-6s %-8s %-9s | %-8s %-8s %-8s %-6s %-8s %-9s | %-8s %-9s %-6s${NC}\n" \
+                    "TOTAL ($node_count)" "-" "$total_pods_ready_display" \
                     "${total_cpu_req_fmt:0:8}" "${total_cpu_lim_fmt:0:8}" "${total_cpu_use_fmt:0:8}" "-" "${total_cpu_cap}" "-" \
                     "${total_mem_req_fmt:0:8}" "${total_mem_lim_fmt:0:8}" "${total_mem_use_fmt:0:8}" "-" "${total_mem_cap_fmt:0:8}" "-" \
                     "${total_disk_use_fmt:0:8}" "${total_disk_cap_fmt:0:9}" "-"
