@@ -74,6 +74,8 @@ show_help() {
     echo "    mem-pct     Memory usage percentage"
     echo "    mem-cap     Memory capacity"
     echo "    mem-req-pct Memory requests percentage"
+    echo "    pods        Total pod count"
+    echo "    pods-ready  Ready pod count"
     echo "    status      Node status/conditions"
     echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
@@ -88,6 +90,9 @@ show_help() {
     echo ""
     echo -e "${BOLD}OUTPUT COLUMNS:${NC}"
     echo "    WORKER_NODE    Node name"
+    echo "    STATUS         Node health status (Ready/NotReady and conditions)"
+    echo "    PODS           Total number of pods on the node"
+    echo "    PODS_READY     Ready pods (format: ready/total)"
     echo "    CPU_REQ        CPU requests allocated to pods"
     echo "    CPU_LIM        CPU limits allocated to pods"
     echo "    CPU_USE        Actual CPU usage"
@@ -100,7 +105,6 @@ show_help() {
     echo "    MEM_%          Memory usage percentage of node capacity"
     echo "    MEM_CAP        Total memory capacity (Gi)"
     echo "    MEM_REQ_%      Memory requests percentage of node capacity"
-    echo "    STATUS         Node health status (Ready/NotReady and conditions)"
     echo ""
     echo -e "${BOLD}COLOR CODING:${NC}"
     echo -e "    ${GREEN}Green${NC}   0-59%  - Normal usage"
@@ -164,7 +168,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -S|--sort)
-            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|status)$ ]]; then
+            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|pods|pods-ready|status)$ ]]; then
                 echo "Error: Invalid sort field. Use 'ktop -h' to see valid options"
                 exit 1
             fi
@@ -282,7 +286,7 @@ validate_env_vars() {
     fi
     
     # Validate SORT_BY
-    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|status)$ ]]; then
+    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|pods|pods-ready|status)$ ]]; then
         echo "Warning: Invalid KTOP_SORT value '$SORT_BY', using default 'cpu-req'"
         SORT_BY="cpu-req"
     fi
@@ -426,6 +430,27 @@ calculate_mem_limits_from_pods() {
         awk '{printf "%.1f", $1}'
 }
 
+# Function to get pod count and ready pod count for a node
+get_pod_counts() {
+    local node=$1
+    
+    # Get pods for this node
+    local pods_json=$(kubectl_with_retry get pods --all-namespaces --field-selector spec.nodeName=$node -o json 2>/dev/null)
+    
+    if [[ -z "$pods_json" ]] || [[ "$pods_json" == "null" ]]; then
+        echo "0|0"
+        return
+    fi
+    
+    # Count total pods
+    local total_pods=$(echo "$pods_json" | jq -r '.items | length' 2>/dev/null || echo "0")
+    
+    # Count ready pods (pods where all containers are ready)
+    local ready_pods=$(echo "$pods_json" | jq -r '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length' 2>/dev/null || echo "0")
+    
+    echo "${total_pods}|${ready_pods}"
+}
+
 # Function to get node conditions and status
 get_node_status() {
     local node_json=$1
@@ -509,7 +534,7 @@ process_node() {
     
     if [[ -z "$node_json" ]] || [[ "$node_json" == "null" ]]; then
         # If kubectl fails, return default values
-        echo "0|$node|0m|0m|0m|0|0|0|0|0|0|0|0|0|1|Unknown"
+        echo "0|$node|0m|0m|0m|0|0|0|0|0|0|0|0|0|1|Unknown|0|0"
         return
     fi
     
@@ -653,6 +678,13 @@ process_node() {
         mem_req_pct=$(echo "scale=1; ($mem_req_gi * 100) / $mem_total_gi" | bc 2>/dev/null || echo "0")
     fi
     
+    # Get pod counts
+    local pod_counts=$(get_pod_counts "$node")
+    local total_pods=$(echo "$pod_counts" | cut -d'|' -f1)
+    local ready_pods=$(echo "$pod_counts" | cut -d'|' -f2)
+    [[ -z "$total_pods" ]] && total_pods=0
+    [[ -z "$ready_pods" ]] && ready_pods=0
+    
     # Determine sort value
     local sort_value
     case "$SORT_BY" in
@@ -669,11 +701,13 @@ process_node() {
         mem-pct)    sort_value=$(printf "%010d" ${mem_use_pct:-0}) ;;
         mem-cap)    sort_value=$(printf "%010.1f" ${mem_total_gi:-0}) ;;
         mem-req-pct) sort_value=$(printf "%010.1f" ${mem_req_pct:-0}) ;;
+        pods)       sort_value=$(printf "%010d" ${total_pods:-0}) ;;
+        pods-ready) sort_value=$(printf "%010d" ${ready_pods:-0}) ;;
         status)     sort_value=$(printf "%010d" $status_code) ;;
         *)          sort_value=$(printf "%010d" $cpu_req_m) ;;
     esac
     
-    echo "$sort_value|$node|$cpu_req|$cpu_lim|$cpu_use|$cpu_use_pct|$cpu_total|$mem_req_gi|$mem_lim_gi|$mem_use_gi|$mem_use_pct|$mem_total_gi|$cpu_req_pct|$mem_req_pct|$status_code|$status_text"
+    echo "$sort_value|$node|$cpu_req|$cpu_lim|$cpu_use|$cpu_use_pct|$cpu_total|$mem_req_gi|$mem_lim_gi|$mem_use_gi|$mem_use_pct|$mem_total_gi|$cpu_req_pct|$mem_req_pct|$status_code|$status_text|$total_pods|$ready_pods"
 }
 
 # Main display function
@@ -696,6 +730,7 @@ display_resources() {
     export -f mi_to_gi
     export -f calculate_mem_from_pods
     export -f calculate_mem_limits_from_pods
+    export -f get_pod_counts
     export -f kubectl_with_retry
     export -f get_node_status
     export SORT_BY
@@ -737,6 +772,8 @@ display_resources() {
     total_mem_lim=0
     total_mem_use=0
     total_mem_cap=0
+    total_pods=0
+    total_ready_pods=0
     node_count=0
     
     # Determine sort options
@@ -753,9 +790,14 @@ display_resources() {
     # Output based on format
     case "$OUTPUT_FORMAT" in
         csv)
-            echo "NODE,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%,STATUS"
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text; do
-                echo "$node,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%,$status_text"
+            echo "NODE,STATUS,PODS,PODS_READY,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%"
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods; do
+                if [[ "$node_pods" == "0" ]]; then
+                    pods_ready_display="0/0"
+                else
+                    pods_ready_display="${node_ready_pods}/${node_pods}"
+                fi
+                echo "$node,$status_text,$node_pods,$pods_ready_display,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%"
             done
             ;;
             
@@ -766,9 +808,9 @@ display_resources() {
             echo '  "sort_order": "'$SORT_ORDER'",'
             echo '  "nodes": ['
             first=true
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text; do
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods; do
                 [[ "$first" == false ]] && echo ","
-                echo -n '    {"name":"'$node'","cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct',"status":"'$status_text'","status_code":'$status_code'}'
+                echo -n '    {"name":"'$node'","status":"'$status_text'","status_code":'$status_code',"pods":'$node_pods',"pods_ready":'$node_ready_pods',"cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct'}'
                 first=false
             done
             echo ""
@@ -778,12 +820,12 @@ display_resources() {
             
         table|*)
             # Header
-            printf "%-24s    %-10s %-8s %-8s %-8s %-6s %-8s %-7s | %-8s %-8s %-8s %-6s %-8s %-6s\n" \
-                "WORKER_NODE" "STATUS" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%"
-            echo "===================================================================================================================================================="
+            printf "%-24s    %-10s %-6s %-10s %-8s %-8s %-8s %-6s %-8s %-7s | %-8s %-8s %-8s %-6s %-8s %-6s\n" \
+                "WORKER_NODE" "STATUS" "PODS" "PODS_READY" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%"
+            echo "=========================================================================================================================================================================="
             
             # Sort and display
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text; do
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods; do
                 # Update totals
                 cpu_req_val=${cpu_req%m}
                 cpu_lim_val=${cpu_lim%m}
@@ -800,7 +842,12 @@ display_resources() {
                 total_mem_lim=$(echo "$total_mem_lim + $mem_lim_gi" | bc 2>/dev/null || echo $total_mem_lim)
                 total_mem_use=$(echo "$total_mem_use + $mem_use_gi" | bc 2>/dev/null || echo $total_mem_use)
                 total_mem_cap=$(echo "$total_mem_cap + $mem_total_gi" | bc 2>/dev/null || echo $total_mem_cap)
+                total_pods=$((total_pods + node_pods))
+                total_ready_pods=$((total_ready_pods + node_ready_pods))
                 node_count=$((node_count + 1))
+                
+                # Save totals to temp file (including pod counts)
+                echo "$total_cpu_req $total_cpu_lim $total_cpu_use $total_cpu_cap $total_mem_req $total_mem_lim $total_mem_use $total_mem_cap $total_pods $total_ready_pods $node_count" > ${temp_file}.totals
                 
                 # Color code percentages and status
                 if [[ "$NO_COLOR" == false ]]; then
@@ -842,6 +889,14 @@ display_resources() {
                 mem_use_display="${mem_use_gi}Gi"
                 mem_cap_display="${mem_total_gi}Gi"
                 
+                # Format pod counts
+                pods_display="$node_pods"
+                if [[ "$node_pods" == "0" ]]; then
+                    pods_ready_display="0/0"
+                else
+                    pods_ready_display="${node_ready_pods}/${node_pods}"
+                fi
+                
                 # Truncate node name if too long (24 char column: 22 chars + ".." = 24)
                 if [[ ${#node} -gt 24 ]]; then
                     node_display="${node:0:22}.."
@@ -856,19 +911,16 @@ display_resources() {
                     status_display="$status_text"
                 fi
                 
-                printf "%-24s    ${status_color}%-10s${NC} %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-7s${NC}   | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-6s${NC}\n" \
-                    "$node_display" "$status_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
+                printf "%-24s    ${status_color}%-10s${NC} %-6s %-10s %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-7s${NC}   | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-6s${NC}\n" \
+                    "$node_display" "$status_display" "$pods_display" "$pods_ready_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
                     "${mem_req_display:0:8}" "${mem_lim_display:0:8}" "${mem_use_display:0:8}" "${mem_pct}%" "${mem_cap_display:0:8}" "${mem_req_pct}%"
-                
-                # Save totals to temp file
-                echo "$total_cpu_req $total_cpu_lim $total_cpu_use $total_cpu_cap $total_mem_req $total_mem_lim $total_mem_use $total_mem_cap $node_count" > ${temp_file}.totals
             done
             
             # Show totals unless disabled
             if [[ "$NO_SUM" == false ]] && [[ -f ${temp_file}.totals ]]; then
-                read total_cpu_req total_cpu_lim total_cpu_use total_cpu_cap total_mem_req total_mem_lim total_mem_use total_mem_cap node_count < ${temp_file}.totals
+                read total_cpu_req total_cpu_lim total_cpu_use total_cpu_cap total_mem_req total_mem_lim total_mem_use total_mem_cap total_pods total_ready_pods node_count < ${temp_file}.totals
                 
-                echo "===================================================================================================================================================="
+                echo "=========================================================================================================================================================================="
                 
                 # Format CPU totals
                 if [[ $total_cpu_req -ge 1000 ]]; then
@@ -895,8 +947,16 @@ display_resources() {
                 total_mem_use_fmt="${total_mem_use}Gi"
                 total_mem_cap_fmt="${total_mem_cap}Gi"
                 
-                printf "${BOLD}%-24s    %-10s %-8s %-8s %-8s %-6s %-8s %-7s   | %-8s %-8s %-8s %-6s %-8s %-6s${NC}\n" \
-                    "TOTAL ($node_count)" "-" \
+                # Format pod totals
+                total_pods_display="$total_pods"
+                if [[ "$total_pods" == "0" ]]; then
+                    total_pods_ready_display="0/0"
+                else
+                    total_pods_ready_display="${total_ready_pods}/${total_pods}"
+                fi
+                
+                printf "${BOLD}%-24s    %-10s %-6s %-10s %-8s %-8s %-8s %-6s %-8s %-7s   | %-8s %-8s %-8s %-6s %-8s %-6s${NC}\n" \
+                    "TOTAL ($node_count)" "-" "$total_pods_display" "$total_pods_ready_display" \
                     "${total_cpu_req_fmt:0:8}" "${total_cpu_lim_fmt:0:8}" "${total_cpu_use_fmt:0:8}" "-" "${total_cpu_cap}" "-" \
                     "${total_mem_req_fmt:0:8}" "${total_mem_lim_fmt:0:8}" "${total_mem_use_fmt:0:8}" "-" "${total_mem_cap_fmt:0:8}" "-"
                 
