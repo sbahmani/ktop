@@ -74,6 +74,9 @@ show_help() {
     echo "    mem-pct     Memory usage percentage"
     echo "    mem-cap     Memory capacity"
     echo "    mem-req-pct Memory requests percentage"
+    echo "    disk-use    Disk usage"
+    echo "    disk-cap    Disk capacity"
+    echo "    disk-pct    Disk usage percentage"
     echo "    pods        Total pod count"
     echo "    pods-ready  Ready pod count"
     echo "    status      Node status/conditions"
@@ -105,6 +108,9 @@ show_help() {
     echo "    MEM_%          Memory usage percentage of node capacity"
     echo "    MEM_CAP        Total memory capacity (Gi)"
     echo "    MEM_REQ_%      Memory requests percentage of node capacity"
+    echo "    DISK_USE       Ephemeral storage usage (Gi)"
+    echo "    DISK_CAP       Ephemeral storage capacity (Gi)"
+    echo "    DISK_%         Disk usage percentage of node capacity"
     echo ""
     echo -e "${BOLD}COLOR CODING:${NC}"
     echo -e "    ${GREEN}Green${NC}   0-59%  - Normal usage"
@@ -168,7 +174,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -S|--sort)
-            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|pods|pods-ready|status)$ ]]; then
+            if [[ ! "$2" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|disk-use|disk-cap|disk-pct|pods|pods-ready|status)$ ]]; then
                 echo "Error: Invalid sort field. Use 'ktop -h' to see valid options"
                 exit 1
             fi
@@ -286,7 +292,7 @@ validate_env_vars() {
     fi
     
     # Validate SORT_BY
-    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|pods|pods-ready|status)$ ]]; then
+    if [[ ! "$SORT_BY" =~ ^(name|cpu-req|cpu-lim|cpu-use|cpu-pct|cpu-cap|cpu-req-pct|mem-req|mem-lim|mem-use|mem-pct|mem-cap|mem-req-pct|disk-use|disk-cap|disk-pct|pods|pods-ready|status)$ ]]; then
         echo "Warning: Invalid KTOP_SORT value '$SORT_BY', using default 'cpu-req'"
         SORT_BY="cpu-req"
     fi
@@ -368,16 +374,23 @@ to_gi() {
         else
             echo "$gi_value"
         fi
-    elif [[ $value == *"Ti" ]]; then
+    elif [[ $value == *"Ti" ]] || [[ $value == *"ti" ]]; then
         local num=${value%Ti}
+        num=${num%ti}
         echo "$num" | awk '{printf "%.1f", $1 * 1024}'
-    elif [[ $value == *"Gi" ]]; then
-        echo "${value%Gi}"
-    elif [[ $value == *"Mi" ]]; then
+    elif [[ $value == *"Gi" ]] || [[ $value == *"gi" ]]; then
+        local gi=${value%Gi}
+        gi=${gi%gi}
+        echo "$gi"
+    elif [[ $value == *"Mi" ]] || [[ $value == *"mi" ]]; then
         local mi=${value%Mi}
+        mi=${mi%mi}
         echo "$mi" | awk '{printf "%.1f", $1 / 1024}'
-    elif [[ $value == *"Ki" ]]; then
+    elif [[ $value == *"Ki" ]] || [[ $value == *"ki" ]] || [[ $value =~ ^[0-9]+k$ ]]; then
+        # Handle both uppercase Ki and lowercase k (Kubernetes sometimes uses lowercase)
         local ki=${value%Ki}
+        ki=${ki%ki}
+        ki=${ki%k}
         echo "$ki" | awk '{printf "%.1f", $1 / (1024*1024)}'
     else
         echo "0"
@@ -449,6 +462,44 @@ get_pod_counts() {
     local ready_pods=$(echo "$pods_json" | jq -r '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length' 2>/dev/null || echo "0")
     
     echo "${total_pods}|${ready_pods}"
+}
+
+# Function to calculate ephemeral storage requests from pods
+calculate_disk_from_pods() {
+    local node=$1
+    
+    kubectl_with_retry get pods --all-namespaces --field-selector spec.nodeName=$node -o json | \
+        jq -r '[.items[].spec.containers[].resources.requests."ephemeral-storage" // "0"] | 
+            map(
+                if test("Ti$") then (. | rtrimstr("Ti") | tonumber * 1024 * 1024)
+                elif test("Gi$") then (. | rtrimstr("Gi") | tonumber * 1024)
+                elif test("Mi$") then (. | rtrimstr("Mi") | tonumber)
+                elif test("Ki$") then (. | rtrimstr("Ki") | tonumber / 1024)
+                elif test("^[0-9]+$") then (. | tonumber / 1024 / 1024)
+                else 0 end
+            ) | add // 0' | \
+        awk '{printf "%.1f", $1}'
+}
+
+# Function to get disk usage from node metrics (if available)
+get_disk_usage() {
+    local node=$1
+    
+    # Try to get from metrics-server API
+    # Note: This may not be available in all clusters
+    local metrics=$(kubectl_with_retry get --raw "/apis/metrics.k8s.io/v1beta1/nodes/$node" 2>/dev/null)
+    
+    if [[ -n "$metrics" ]] && [[ "$metrics" != "null" ]]; then
+        local disk_usage=$(echo "$metrics" | jq -r '.usage."ephemeral-storage" // empty' 2>/dev/null)
+        if [[ -n "$disk_usage" ]] && [[ "$disk_usage" != "null" ]]; then
+            # Convert to Mi (metrics-server returns in bytes)
+            echo "$disk_usage" | awk '{printf "%.1f", $1 / 1024 / 1024}'
+            return
+        fi
+    fi
+    
+    # Fallback: return empty (will use requests as proxy)
+    echo ""
 }
 
 # Function to get node conditions and status
@@ -534,7 +585,7 @@ process_node() {
     
     if [[ -z "$node_json" ]] || [[ "$node_json" == "null" ]]; then
         # If kubectl fails, return default values
-        echo "0|$node|0m|0m|0m|0|0|0|0|0|0|0|0|0|1|Unknown|0|0"
+        echo "0|$node|0m|0m|0m|0|0|0|0|0|0|0|0|0|1|Unknown|0|0|0|0|0|0"
         return
     fi
     
@@ -544,9 +595,16 @@ process_node() {
     local status_text=$(echo "$status_info" | cut -d'|' -f2)
     
     # Extract capacity data in one jq call (faster than multiple calls)
+    # Note: ephemeral-storage might not be in allocatable, we'll handle it separately
     local capacity_data=$(echo "$node_json" | jq -r '.status.allocatable | "\(.cpu)|\(.memory)"' 2>/dev/null)
     local cpu_capacity=$(echo "$capacity_data" | cut -d'|' -f1)
     local mem_capacity=$(echo "$capacity_data" | cut -d'|' -f2)
+    
+    # Get ephemeral-storage from Capacity and Allocatable separately
+    # DISK_CAP = Capacity.ephemeral-storage
+    # DISK_USE = Capacity.ephemeral-storage - Allocatable.ephemeral-storage
+    local disk_capacity=$(echo "$node_json" | jq -r '.status.capacity."ephemeral-storage" // empty' 2>/dev/null)
+    local disk_allocatable=$(echo "$node_json" | jq -r '.status.allocatable."ephemeral-storage" // empty' 2>/dev/null)
     
     # Convert CPU capacity to cores
     local cpu_total
@@ -571,6 +629,39 @@ process_node() {
         fi
     fi
     
+    # Convert disk capacity to Gi (use Capacity.ephemeral-storage)
+    local disk_total_gi="0"
+    if [[ -n "$disk_capacity" ]] && [[ "$disk_capacity" != "0" ]] && [[ "$disk_capacity" != "null" ]] && [[ "$disk_capacity" != "empty" ]]; then
+        # Ephemeral-storage is usually in bytes (plain number), convert to Gi
+        disk_total_gi=$(to_gi "$disk_capacity")
+        if [[ "$disk_total_gi" == "ERR" ]] || [[ -z "$disk_total_gi" ]]; then
+            # If to_gi failed, try direct conversion assuming bytes
+            if [[ "$disk_capacity" =~ ^[0-9]+$ ]]; then
+                disk_total_gi=$(echo "$disk_capacity" | awk '{printf "%.1f", $1 / (1024*1024*1024)}')
+            else
+                disk_total_gi="0"
+            fi
+        fi
+    fi
+    
+    # Calculate disk usage as Capacity - Allocatable (system reserved space)
+    # Note: Capacity and Allocatable may be in different units (e.g., Capacity in KiB, Allocatable in bytes)
+    local disk_allocatable_gi="0"
+    if [[ -n "$disk_allocatable" ]] && [[ "$disk_allocatable" != "0" ]] && [[ "$disk_allocatable" != "null" ]] && [[ "$disk_allocatable" != "empty" ]]; then
+        # Try to_gi first (handles units like Ki, Mi, Gi)
+        disk_allocatable_gi=$(to_gi "$disk_allocatable")
+        
+        # If to_gi failed or returned ERR, and allocatable is a plain number, assume bytes
+        if [[ "$disk_allocatable_gi" == "ERR" ]] || [[ -z "$disk_allocatable_gi" ]]; then
+            if [[ "$disk_allocatable" =~ ^[0-9]+$ ]]; then
+                # Plain number - assume bytes and convert to Gi
+                disk_allocatable_gi=$(echo "$disk_allocatable" | awk '{printf "%.1f", $1 / (1024*1024*1024)}')
+            else
+                disk_allocatable_gi="0"
+            fi
+        fi
+    fi
+    
     # Get allocated resources from describe
     # Note: Allocated resources are not stored in node JSON, only in describe output
     local describe=$(kubectl_with_retry describe node $node 2>/dev/null)
@@ -581,7 +672,7 @@ process_node() {
         mem_req_raw="0"
         mem_lim_raw="0"
     else
-        local allocated=$(echo "$describe" | grep -A 10 "Allocated resources:")
+        local allocated=$(echo "$describe" | grep -A 15 "Allocated resources:")
         
         # Extract CPU line
         local cpu_line=$(echo "$allocated" | grep "cpu" | head -1)
@@ -592,6 +683,13 @@ process_node() {
         local mem_line=$(echo "$allocated" | grep "memory" | head -1)
         mem_req_raw=$(echo "$mem_line" | awk '{print $2}')
         mem_lim_raw=$(echo "$mem_line" | awk '{print $4}')
+        
+        # Extract Ephemeral Storage line (if available)
+        local disk_line=$(echo "$allocated" | grep -i "ephemeral-storage\|ephemeral" | head -1)
+        if [[ -n "$disk_line" ]]; then
+            disk_req_raw=$(echo "$disk_line" | awk '{print $2}')
+            disk_lim_raw=$(echo "$disk_line" | awk '{print $4}')
+        fi
     fi
     
     # Default values if empty
@@ -599,6 +697,8 @@ process_node() {
     cpu_lim=${cpu_lim_raw:-0m}
     mem_req_raw=${mem_req_raw:-0}
     mem_lim_raw=${mem_lim_raw:-0}
+    disk_req_raw=${disk_req_raw:-0}
+    disk_lim_raw=${disk_lim_raw:-0}
     
     # Convert memory request to Gi
     local mem_req_gi=$(to_gi "$mem_req_raw")
@@ -652,6 +752,65 @@ process_node() {
     # Convert memory usage to Gi
     local mem_use_gi=$(mi_to_gi "$mem_use_mi")
     
+    # Get actual disk usage from metrics-server (preferred) or calculate as Capacity - Allocatable (fallback)
+    # DISK_USE = actual usage from metrics-server, or Capacity.ephemeral-storage - Allocatable.ephemeral-storage
+    local disk_use_gi="0"
+    local disk_req_gi="0"
+    
+    # Ensure both values are numeric
+    [[ -z "$disk_total_gi" ]] && disk_total_gi="0"
+    [[ "$disk_total_gi" == "ERR" ]] && disk_total_gi="0"
+    [[ -z "$disk_allocatable_gi" ]] && disk_allocatable_gi="0"
+    [[ "$disk_allocatable_gi" == "ERR" ]] && disk_allocatable_gi="0"
+    
+    # First, try to get actual disk usage from metrics-server
+    local disk_use_mi=$(get_disk_usage "$node")
+    if [[ -n "$disk_use_mi" ]] && [[ "$disk_use_mi" != "0" ]] && [[ "$disk_use_mi" != "" ]]; then
+        # We have actual usage from metrics-server (in Mi), convert to Gi
+        disk_use_gi=$(echo "$disk_use_mi" | awk '{printf "%.1f", $1 / 1024}')
+    elif [[ "$disk_total_gi" != "0" ]] && [[ "$disk_allocatable_gi" != "0" ]]; then
+        # Fallback: Calculate usage as Capacity - Allocatable (system reserved space)
+        # Sanity check: Allocatable should not exceed Capacity
+        # If Allocatable > Capacity, there might be a unit mismatch
+        # Try treating Allocatable as KiB if Capacity is in KiB
+        if (( $(echo "$disk_allocatable_gi > $disk_total_gi" | bc -l 2>/dev/null || echo 0) )); then
+            # Allocatable exceeds Capacity - likely unit mismatch
+            # If Capacity has Ki/ki/k suffix, try treating Allocatable as KiB
+            if [[ "$disk_capacity" == *"Ki" ]] || [[ "$disk_capacity" == *"ki" ]] || [[ "$disk_capacity" =~ ^[0-9]+k$ ]]; then
+                if [[ "$disk_allocatable" =~ ^[0-9]+$ ]]; then
+                    # Recalculate Allocatable as KiB
+                    disk_allocatable_gi=$(echo "$disk_allocatable" | awk '{printf "%.1f", $1 / (1024*1024)}')
+                fi
+            fi
+        fi
+        
+        disk_use_gi=$(echo "scale=1; $disk_total_gi - $disk_allocatable_gi" | bc 2>/dev/null || echo "0")
+        # Ensure non-negative and that Allocatable doesn't exceed Capacity
+        if (( $(echo "$disk_use_gi < 0" | bc -l 2>/dev/null || echo 0) )); then
+            disk_use_gi="0"
+        fi
+        if (( $(echo "$disk_allocatable_gi > $disk_total_gi" | bc -l 2>/dev/null || echo 0) )); then
+            # Still invalid - set to 0 to indicate error
+            disk_use_gi="0"
+            disk_allocatable_gi="0"
+        fi
+    fi
+    
+    # Get disk requests for reference (not used in display, but kept for potential future use)
+    if [[ -n "$disk_req_raw" ]] && [[ "$disk_req_raw" != "0" ]]; then
+        local disk_req_gi_temp=$(to_gi "$disk_req_raw")
+        disk_req_gi=$(echo "$disk_req_gi_temp" | awk '{printf "%.1f", $1}')
+    else
+        local disk_req_mi=$(calculate_disk_from_pods "$node")
+        disk_req_gi=$(echo "$disk_req_mi" | awk '{printf "%.1f", $1 / 1024}')
+    fi
+    
+    # Calculate disk usage percentage
+    local disk_use_pct="0"
+    if [[ "$disk_total_gi" != "0" ]] && [[ -n "$disk_use_gi" ]] && [[ "$disk_use_gi" != "0" ]]; then
+        disk_use_pct=$(echo "scale=1; ($disk_use_gi * 100) / $disk_total_gi" | bc 2>/dev/null || echo "0")
+    fi
+    
     # Prepare sort values
     local cpu_req_m=${cpu_req%m}
     local cpu_lim_m=${cpu_lim%m}
@@ -701,13 +860,16 @@ process_node() {
         mem-pct)    sort_value=$(printf "%010d" ${mem_use_pct:-0}) ;;
         mem-cap)    sort_value=$(printf "%010.1f" ${mem_total_gi:-0}) ;;
         mem-req-pct) sort_value=$(printf "%010.1f" ${mem_req_pct:-0}) ;;
+        disk-use)   sort_value=$(printf "%010.1f" ${disk_use_gi:-0}) ;;
+        disk-cap)   sort_value=$(printf "%010.1f" ${disk_total_gi:-0}) ;;
+        disk-pct)   sort_value=$(printf "%010.1f" ${disk_use_pct:-0}) ;;
         pods)       sort_value=$(printf "%010d" ${total_pods:-0}) ;;
         pods-ready) sort_value=$(printf "%010d" ${ready_pods:-0}) ;;
         status)     sort_value=$(printf "%010d" $status_code) ;;
         *)          sort_value=$(printf "%010d" $cpu_req_m) ;;
     esac
     
-    echo "$sort_value|$node|$cpu_req|$cpu_lim|$cpu_use|$cpu_use_pct|$cpu_total|$mem_req_gi|$mem_lim_gi|$mem_use_gi|$mem_use_pct|$mem_total_gi|$cpu_req_pct|$mem_req_pct|$status_code|$status_text|$total_pods|$ready_pods"
+    echo "$sort_value|$node|$cpu_req|$cpu_lim|$cpu_use|$cpu_use_pct|$cpu_total|$mem_req_gi|$mem_lim_gi|$mem_use_gi|$mem_use_pct|$mem_total_gi|$cpu_req_pct|$mem_req_pct|$status_code|$status_text|$total_pods|$ready_pods|$disk_use_gi|$disk_total_gi|$disk_use_pct|$disk_req_gi"
 }
 
 # Main display function
@@ -730,6 +892,8 @@ display_resources() {
     export -f mi_to_gi
     export -f calculate_mem_from_pods
     export -f calculate_mem_limits_from_pods
+    export -f calculate_disk_from_pods
+    export -f get_disk_usage
     export -f get_pod_counts
     export -f kubectl_with_retry
     export -f get_node_status
@@ -772,6 +936,9 @@ display_resources() {
     total_mem_lim=0
     total_mem_use=0
     total_mem_cap=0
+    total_disk_use=0
+    total_disk_cap=0
+    total_disk_req=0
     total_pods=0
     total_ready_pods=0
     node_count=0
@@ -790,14 +957,14 @@ display_resources() {
     # Output based on format
     case "$OUTPUT_FORMAT" in
         csv)
-            echo "NODE,STATUS,PODS,PODS_READY,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%"
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods; do
+            echo "NODE,STATUS,PODS,PODS_READY,CPU_REQ,CPU_LIM,CPU_USE,CPU_%,CPU_TOTAL,CPU_REQ_%,MEM_REQ,MEM_LIM,MEM_USE,MEM_%,MEM_TOTAL,MEM_REQ_%,DISK_USE,DISK_CAP,DISK_%,DISK_REQ"
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods disk_use_gi disk_total_gi disk_use_pct disk_req_gi; do
                 if [[ "$node_pods" == "0" ]]; then
                     pods_ready_display="0/0"
                 else
                     pods_ready_display="${node_ready_pods}/${node_pods}"
                 fi
-                echo "$node,$status_text,$node_pods,$pods_ready_display,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%"
+                echo "$node,$status_text,$node_pods,$pods_ready_display,$cpu_req,$cpu_lim,$cpu_use,$cpu_pct%,$cpu_total,$cpu_req_pct%,${mem_req_gi}Gi,${mem_lim_gi}Gi,${mem_use_gi}Gi,$mem_pct%,${mem_total_gi}Gi,$mem_req_pct%,${disk_use_gi}Gi,${disk_total_gi}Gi,$disk_use_pct%,${disk_req_gi}Gi"
             done
             ;;
             
@@ -808,9 +975,9 @@ display_resources() {
             echo '  "sort_order": "'$SORT_ORDER'",'
             echo '  "nodes": ['
             first=true
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods; do
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods disk_use_gi disk_total_gi disk_use_pct disk_req_gi; do
                 [[ "$first" == false ]] && echo ","
-                echo -n '    {"name":"'$node'","status":"'$status_text'","status_code":'$status_code',"pods":'$node_pods',"pods_ready":'$node_ready_pods',"cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct'}'
+                echo -n '    {"name":"'$node'","status":"'$status_text'","status_code":'$status_code',"pods":'$node_pods',"pods_ready":'$node_ready_pods',"cpu_req":"'$cpu_req'","cpu_lim":"'$cpu_lim'","cpu_use":"'$cpu_use'","cpu_pct":'$cpu_pct',"cpu_total":'$cpu_total',"cpu_req_pct":'$cpu_req_pct',"mem_req_gi":'$mem_req_gi',"mem_lim_gi":'$mem_lim_gi',"mem_use_gi":'$mem_use_gi',"mem_pct":'$mem_pct',"mem_total_gi":'$mem_total_gi',"mem_req_pct":'$mem_req_pct',"disk_use_gi":'$disk_use_gi',"disk_cap_gi":'$disk_total_gi',"disk_pct":'$disk_use_pct',"disk_req_gi":'$disk_req_gi'}'
                 first=false
             done
             echo ""
@@ -819,13 +986,15 @@ display_resources() {
             ;;
             
         table|*)
-            # Header
-            printf "%-24s    %-10s %-6s %-10s %-8s %-8s %-8s %-6s %-8s %-7s | %-8s %-8s %-8s %-6s %-8s %-6s\n" \
-                "WORKER_NODE" "STATUS" "PODS" "PODS_READY" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%"
-            echo "=========================================================================================================================================================================="
+            # Header - format must account for header text lengths (CPU_REQ_% and MEM_REQ_% are 9 chars)
+            # Use wider format for percentage columns to accommodate header text
+            # DISK_CAP needs 9 chars to accommodate values like "17811.2Gi"
+            printf "%-24s    %-10s %-6s %-10s   | %-8s %-8s %-8s %-6s %-8s %-9s   | %-8s %-8s %-8s %-6s %-8s %-9s   | %-8s %-9s %-6s\n" \
+                "WORKER_NODE" "STATUS" "PODS" "PODS_READY" "CPU_REQ" "CPU_LIM" "CPU_USE" "CPU_%" "CPU_CAP" "CPU_REQ_%" "MEM_REQ" "MEM_LIM" "MEM_USE" "MEM_%" "MEM_CAP" "MEM_REQ_%" "DISK_USE" "DISK_CAP" "DISK_%"
+                echo "==========================================================================================================================================================================================================="
             
             # Sort and display
-            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods; do
+            eval "$SORT_CMD $temp_file" | while IFS='|' read -r sort_val node cpu_req cpu_lim cpu_use cpu_pct cpu_total mem_req_gi mem_lim_gi mem_use_gi mem_pct mem_total_gi cpu_req_pct mem_req_pct status_code status_text node_pods node_ready_pods disk_use_gi disk_total_gi disk_use_pct disk_req_gi; do
                 # Update totals
                 cpu_req_val=${cpu_req%m}
                 cpu_lim_val=${cpu_lim%m}
@@ -842,12 +1011,15 @@ display_resources() {
                 total_mem_lim=$(echo "$total_mem_lim + $mem_lim_gi" | bc 2>/dev/null || echo $total_mem_lim)
                 total_mem_use=$(echo "$total_mem_use + $mem_use_gi" | bc 2>/dev/null || echo $total_mem_use)
                 total_mem_cap=$(echo "$total_mem_cap + $mem_total_gi" | bc 2>/dev/null || echo $total_mem_cap)
+                total_disk_use=$(echo "$total_disk_use + $disk_use_gi" | bc 2>/dev/null || echo $total_disk_use)
+                total_disk_cap=$(echo "$total_disk_cap + $disk_total_gi" | bc 2>/dev/null || echo $total_disk_cap)
+                total_disk_req=$(echo "$total_disk_req + $disk_req_gi" | bc 2>/dev/null || echo $total_disk_req)
                 total_pods=$((total_pods + node_pods))
                 total_ready_pods=$((total_ready_pods + node_ready_pods))
                 node_count=$((node_count + 1))
                 
-                # Save totals to temp file (including pod counts)
-                echo "$total_cpu_req $total_cpu_lim $total_cpu_use $total_cpu_cap $total_mem_req $total_mem_lim $total_mem_use $total_mem_cap $total_pods $total_ready_pods $node_count" > ${temp_file}.totals
+                # Save totals to temp file (including pod counts and disk)
+                echo "$total_cpu_req $total_cpu_lim $total_cpu_use $total_cpu_cap $total_mem_req $total_mem_lim $total_mem_use $total_mem_cap $total_disk_use $total_disk_cap $total_disk_req $total_pods $total_ready_pods $node_count" > ${temp_file}.totals
                 
                 # Color code percentages and status
                 if [[ "$NO_COLOR" == false ]]; then
@@ -867,6 +1039,15 @@ display_resources() {
                         mem_color="${GREEN}"
                     fi
                     
+                    # Color code disk percentage
+                    if [[ ${disk_use_pct%.*} -ge 80 ]]; then
+                        disk_color="${RED}"
+                    elif [[ ${disk_use_pct%.*} -ge 60 ]]; then
+                        disk_color="${YELLOW}"
+                    else
+                        disk_color="${GREEN}"
+                    fi
+                    
                     # Color code status
                     if [[ "$status_code" == "0" ]]; then
                         status_color="${GREEN}"
@@ -880,6 +1061,7 @@ display_resources() {
                 else
                     cpu_color=""
                     mem_color=""
+                    disk_color=""
                     status_color=""
                 fi
                 
@@ -888,6 +1070,10 @@ display_resources() {
                 mem_lim_display="${mem_lim_gi}Gi"
                 mem_use_display="${mem_use_gi}Gi"
                 mem_cap_display="${mem_total_gi}Gi"
+                
+                # Format disk values
+                disk_use_display="${disk_use_gi}Gi"
+                disk_cap_display="${disk_total_gi}Gi"
                 
                 # Format pod counts
                 pods_display="$node_pods"
@@ -911,16 +1097,17 @@ display_resources() {
                     status_display="$status_text"
                 fi
                 
-                printf "%-24s    ${status_color}%-10s${NC} %-6s %-10s %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-7s${NC}   | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-6s${NC}\n" \
+                printf "%-24s    ${status_color}%-10s${NC} %-6s %-10s   | %-8s %-8s %-8s ${cpu_color}%-6s${NC} %-8s ${cpu_color}%-9s${NC}   | %-8s %-8s %-8s ${mem_color}%-6s${NC} %-8s ${mem_color}%-9s${NC}   | %-8s %-9s ${disk_color}%-6s${NC}\n" \
                     "$node_display" "$status_display" "$pods_display" "$pods_ready_display" "$cpu_req" "$cpu_lim" "$cpu_use" "${cpu_pct}%" "$cpu_total" "${cpu_req_pct}%" \
-                    "${mem_req_display:0:8}" "${mem_lim_display:0:8}" "${mem_use_display:0:8}" "${mem_pct}%" "${mem_cap_display:0:8}" "${mem_req_pct}%"
+                    "${mem_req_display:0:8}" "${mem_lim_display:0:8}" "${mem_use_display:0:8}" "${mem_pct}%" "${mem_cap_display:0:8}" "${mem_req_pct}%" \
+                    "${disk_use_display:0:8}" "${disk_cap_display:0:9}" "${disk_use_pct}%"
             done
             
             # Show totals unless disabled
             if [[ "$NO_SUM" == false ]] && [[ -f ${temp_file}.totals ]]; then
-                read total_cpu_req total_cpu_lim total_cpu_use total_cpu_cap total_mem_req total_mem_lim total_mem_use total_mem_cap total_pods total_ready_pods node_count < ${temp_file}.totals
+                read total_cpu_req total_cpu_lim total_cpu_use total_cpu_cap total_mem_req total_mem_lim total_mem_use total_mem_cap total_disk_use total_disk_cap total_disk_req total_pods total_ready_pods node_count < ${temp_file}.totals
                 
-                echo "=========================================================================================================================================================================="
+                echo "=========================================================================================================================================================================================================="
                 
                 # Format CPU totals
                 if [[ $total_cpu_req -ge 1000 ]]; then
@@ -947,6 +1134,10 @@ display_resources() {
                 total_mem_use_fmt="${total_mem_use}Gi"
                 total_mem_cap_fmt="${total_mem_cap}Gi"
                 
+                # Format disk totals
+                total_disk_use_fmt="${total_disk_use}Gi"
+                total_disk_cap_fmt="${total_disk_cap}Gi"
+                
                 # Format pod totals
                 total_pods_display="$total_pods"
                 if [[ "$total_pods" == "0" ]]; then
@@ -955,10 +1146,11 @@ display_resources() {
                     total_pods_ready_display="${total_ready_pods}/${total_pods}"
                 fi
                 
-                printf "${BOLD}%-24s    %-10s %-6s %-10s %-8s %-8s %-8s %-6s %-8s %-7s   | %-8s %-8s %-8s %-6s %-8s %-6s${NC}\n" \
+                printf "${BOLD}%-24s    %-10s %-6s %-10s   | %-8s %-8s %-8s %-6s %-8s %-9s   | %-8s %-8s %-8s %-6s %-8s %-9s   | %-8s %-9s %-6s${NC}\n" \
                     "TOTAL ($node_count)" "-" "$total_pods_display" "$total_pods_ready_display" \
                     "${total_cpu_req_fmt:0:8}" "${total_cpu_lim_fmt:0:8}" "${total_cpu_use_fmt:0:8}" "-" "${total_cpu_cap}" "-" \
-                    "${total_mem_req_fmt:0:8}" "${total_mem_lim_fmt:0:8}" "${total_mem_use_fmt:0:8}" "-" "${total_mem_cap_fmt:0:8}" "-"
+                    "${total_mem_req_fmt:0:8}" "${total_mem_lim_fmt:0:8}" "${total_mem_use_fmt:0:8}" "-" "${total_mem_cap_fmt:0:8}" "-" \
+                    "${total_disk_use_fmt:0:8}" "${total_disk_cap_fmt:0:9}" "-"
                 
                 rm -f ${temp_file}.totals
             fi
